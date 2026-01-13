@@ -55,8 +55,7 @@ The algorithm uses **4 key features** to predict entailment:
 - **Source:** Fine-tuned SBERT bi-encoder.
 - **Function:** Weights cosine similarity of $A$ to $[B]$ and $B$ to $[A]$.
 - **Formula:**
-  ![equation](https://latex.codecogs.com/svg.image?S_{AB}=\sigma_{AB}\left[\frac{\alpha}{|\mathcal{I}(A)|}\sum_{k\in\mathcal{I}(A)}\sigma_{AC}+\frac{1-\alpha}{|\mathcal{I}(B)|}\sum_{k\in\mathcal{I}(B)}\sigma_{BC}\right])
-
+![equation](https://latex.codecogs.com/svg.image?\color{white}{S_{AB}=\sigma_{AB}\left[\frac{\alpha}{|\mathcal{I}(A)|}\sum_{k\in\mathcal{I}(A)}\sigma_{AC}+\frac{1-\alpha}{|\mathcal{I}(B)|}\sum_{k\in\mathcal{I}(B)}\sigma_{BC}\right]})
   Where:
   - $\sigma_{ij}$ is the cosine similarity of $i$ and $j$.
   - $\mathcal{I}(j) = [j]$ (the equivalence class of $j$).
