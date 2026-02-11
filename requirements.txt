@@ -1,0 +1,19 @@
+# Requirements for fea_project - add/remove as needed
+jupyter
+ipykernel
+nbconvert
+pandas
+numpy
+plotly
+datasets
+sentence-transformers
+transformers
+torch
+scikit-learn
+tqdm
+sentencepiece
+scipy
+openpyxl
+openai
+pydantic
+huggingface-hub

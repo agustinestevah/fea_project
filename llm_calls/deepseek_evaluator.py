@@ -15,7 +15,7 @@ from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_sc
 from tqdm import tqdm
 from typing import Dict, List, Optional
 
-from llm_calls.prompts import *
+from prompts import *
 
 class ResponseSchema(BaseModel):
     sentence_id_1: str # ids of the sentences being compared
@@ -28,7 +28,7 @@ class ResponseSchema(BaseModel):
 
 class EntailmentEvaluator:
     def __init__(self, model_name="deepseek-chat", prompt_type="default",
-                api_key=os.environ.get("DEEPSEEK_API_KEY"), base_url="https://api.deepseek.com/v1"):
+                api_key=os.environ.get('DEEPSEEK_API_KEY'), base_url="https://api.deepseek.com/v1"):
         self.client = OpenAI(api_key=api_key, base_url = base_url)
         self.model_name = model_name
         self.prompt_type = prompt_type
@@ -85,15 +85,50 @@ class EntailmentEvaluator:
                                          If an error occurs, a dictionary with an error message is returned.
         """
         try:
-            response = self.client.chat.completions.create(
-                model=self.model_name,
-                messages=[{"role": "user", "content": prompt}],
-                response_format={"type": "json_object"},  # REQUIRED for JSON output
-                max_tokens=1200,
-                temperature=0
-            )
+            # deepseek-reasoner does not support response_format or temperature
+            # It also needs a much higher max_tokens since reasoning tokens are separate
+            max_tok = 8192 if "reasoner" in self.model_name else 1200
+            api_kwargs = {
+                "model": self.model_name,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": max_tok,
+            }
+            if "reasoner" not in self.model_name:
+                api_kwargs["response_format"] = {"type": "json_object"}
+                api_kwargs["temperature"] = 0
+
+            response = self.client.chat.completions.create(**api_kwargs)
             
-            response_content = response.choices[0].message.content.strip()
+            msg = response.choices[0].message
+            content = msg.content or ''
+            reasoning = getattr(msg, 'reasoning_content', '') or ''
+            
+            # Debug: log what we got back (first call only)
+            if not hasattr(self, '_debug_logged'):
+                print(f"[DEBUG] content length: {len(content)}, reasoning_content length: {len(reasoning)}")
+                if content:
+                    print(f"[DEBUG] content preview: {content[:300]}")
+                if reasoning:
+                    print(f"[DEBUG] reasoning preview: {reasoning[:300]}")
+                self._debug_logged = True
+            
+            # Use content first; if empty, try to extract JSON from reasoning_content
+            response_content = content if content.strip() else reasoning
+            
+            # Extract JSON from response (reasoner may wrap it in markdown code blocks)
+            response_content = response_content.strip()
+            if response_content.startswith("```"):
+                # Strip markdown code fence
+                lines = response_content.split("\n")
+                lines = [l for l in lines if not l.strip().startswith("```")]
+                response_content = "\n".join(lines).strip()
+            
+            # Try to find JSON object in the response
+            if not response_content.startswith("{"):
+                import re
+                json_match = re.search(r'\{.*\}', response_content, re.DOTALL)
+                if json_match:
+                    response_content = json_match.group(0)
             
             try:
                 response_dict = json.loads(response_content)
