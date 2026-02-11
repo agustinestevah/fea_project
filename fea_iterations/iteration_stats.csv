@@ -1,0 +1,5 @@
+iteration,labeled_input,unlabeled_available,pairs_selected,cumulative_labeled,unlabeled_remaining,output_file,entailment_ratio,total_cost
+0,5000,5000,103,5103,4897,fea_iterations/llm_batch_iter_0.csv,0.42718446601941745,0.3743
+1,5103,4897,52,5155,4845,fea_iterations/llm_batch_iter_1.csv,0.25,0.3743
+2,5155,4845,27,5182,4818,fea_iterations/llm_batch_iter_2.csv,0.4444444444444444,0.3743
+3,5182,4818,15,5197,4803,fea_iterations/llm_batch_iter_3.csv,0.13333333333333333,0.3743

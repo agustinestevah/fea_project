@@ -1,0 +1,9 @@
+fine_tuned_bi_model/
+fine_tuned_nli_model/
+__pycache__/
+hf_cache/
+checkpoints/
+my_custom_libs/
+.ipynb_checkpoints/
+fea_iterations/loop_data/
+fea_iterations/temp_data/
