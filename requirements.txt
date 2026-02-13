@@ -1,19 +1,34 @@
-# Requirements for fea_project - add/remove as needed
+# Requirements for fea_project
+# Core
+numpy<2.0
+pandas
+scipy
+openpyxl
+
+# ML / Embeddings
+torch
+sentence-transformers
+transformers
+huggingface-hub
+accelerate>=0.31.0
+scikit-learn
+datasets
+sentencepiece
+
+# Hyperparameter tuning
+optuna
+
+# LLM calls
+openai
+pydantic
+tqdm
+
+# Visualization
+plotly
+
+# Notebook tooling
 jupyter
 ipykernel
 nbconvert
-pandas
-numpy
-plotly
-datasets
-sentence-transformers
-transformers
-torch
-scikit-learn
-tqdm
-sentencepiece
-scipy
-openpyxl
-openai
-pydantic
-huggingface-hub
+papermill
+scrapbook

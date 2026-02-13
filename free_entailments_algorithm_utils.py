@@ -38,6 +38,7 @@ def generate_valid_pairs(
     sample_n_bb: Optional[int] = None,
     sample_n_bs: Optional[int] = None,
     top_k_bs: Optional[int] = None,
+    exclude_labeled_csv: Optional[str] = "labeled_pairs/llm_labeled_pairs.csv",
 ) -> pd.DataFrame:
     """
     Generate valid pairwise combinations from premise and conclusion dataframes.
@@ -102,6 +103,10 @@ def generate_valid_pairs(
         ``top_k_bs`` BS pairs (by cosine similarity) before sampling.
         Also used *inside* each group scan to cap intermediate BS results
         so they don't blow up memory.
+    exclude_labeled_csv : str or None, default="labeled_pairs/llm_labeled_pairs.csv"
+        Path to a CSV of already-labeled pairs (``sentence_id_1``,
+        ``sentence_id_2``).  Any matching pairs are removed from the
+        output.  Set to ``None`` to disable filtering.
     
     Returns
     -------
@@ -312,6 +317,10 @@ def generate_valid_pairs(
         print(f"Book-Speech pairs:  {n_bs:,}")
         print(f"Total pairs:        {len(all_pairs):,}")
 
+        # Filter out already-labeled pairs
+        if exclude_labeled_csv:
+            all_pairs = filter_already_labeled(all_pairs, labeled_csv=exclude_labeled_csv)
+
         return all_pairs
 
     # ================================================================
@@ -438,6 +447,10 @@ def generate_valid_pairs(
     print(f"Total valid pairs: {len(all_pairs):,}")
     print(f"Columns: {list(all_pairs.columns)}")
     
+    # Filter out already-labeled pairs
+    if exclude_labeled_csv:
+        all_pairs = filter_already_labeled(all_pairs, labeled_csv=exclude_labeled_csv)
+
     return all_pairs
 
 
@@ -580,10 +593,10 @@ def generate_valid_pairs_by_type(
 def setminus(
     df_big: pd.DataFrame,
     df_small: pd.DataFrame,
-    id_cols: List[str] = ['id1', 'id2']
+    id_cols: Optional[List[str]] = None,
 ) -> pd.DataFrame:
     """
-    Perform set difference operation: df_big \ df_small
+    Perform set difference operation: df_big minus df_small
     
     Returns rows from df_big whose (id1, id2) pairs are not present in df_small.
     
@@ -608,6 +621,9 @@ def setminus(
     >>> result = setminus(df_big, df_small)
     >>> # result contains rows with (B,Y) and (C,Z) but not (A,X)
     """
+    if id_cols is None:
+        id_cols = ['id1', 'id2']
+    
     # Create a set of tuples from df_small for efficient lookup
     small_pairs = set(zip(df_small[id_cols[0]], df_small[id_cols[1]]))
     
@@ -746,11 +762,16 @@ def merge_pairwise_texts(
     )
     
     # Filter pairs based on comparison rules
+    if len(df2_reduced) == 0:
+        print(f"Warning: df2 is empty (0 pairs). Returning empty result.")
+        return pd.DataFrame(columns=["id1", "id2", "text1", "text2", "verdict"])
+
     valid_mask = df2_reduced.apply(lambda row: is_valid_pair(row['id1'], row['id2']), axis=1)
     df2_filtered = df2_reduced[valid_mask].copy()
     
     if len(df2_filtered) == 0:
         print(f"Warning: All {len(df2_reduced)} pairs were filtered out by comparison rules.")
+        return pd.DataFrame(columns=["id1", "id2", "text1", "text2", "verdict"])
     elif len(df2_filtered) < len(df2_reduced):
         print(f"Filtered {len(df2_reduced) - len(df2_filtered)} pairs (kept {len(df2_filtered)}).")
 
@@ -776,75 +797,6 @@ def merge_pairwise_texts(
 
     # Reorder columns
     return merged[["id1", "id2", "text1", "text2", "verdict"]]
-
-def create_embedding_cache(
-    df_texts: pd.DataFrame,
-    id_col: str,
-    text_col: str,
-    model_name: str = "BAAI/bge-large-en-v1.5",
-    batch_size: int = 128,
-    show_progress_bar: bool = True
-) -> Dict[str, np.ndarray]:
-    """
-    Pre-compute embeddings for all unique texts and return a cache dictionary.
-    This is the KEY OPTIMIZATION - embed once, reuse everywhere.
-
-    Parameters
-    ----------
-    df_texts : pd.DataFrame
-        DataFrame containing unique IDs and their texts.
-    id_col : str
-        Name of the ID column.
-    text_col : str
-        Name of the text column.
-    model_name : str, default "BAAI/bge-large-en-v1.5"
-        SentenceTransformer model to use.
-    batch_size : int, default 128
-        Batch size for encoding.
-    show_progress_bar : bool, default True
-        Whether to show progress bar during encoding.
-
-    Returns
-    -------
-    dict
-        Dictionary mapping {id: embedding_vector} for all texts.
-    """
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = SentenceTransformer(model_name, device=device)
-    if device == "cuda":
-        model.half()
-
-    # Get unique id-text pairs (in case of duplicates)
-    df_unique = df_texts[[id_col, text_col]].drop_duplicates(subset=[id_col])
-    
-    print(f"\n>>> Creating Embedding Cache")
-    print(f"Model: {model_name}")
-    print(f"Total unique texts: {len(df_unique)}")
-    print(f"Device: {device}")
-    
-    # Encode all texts
-    embeddings = model.encode(
-        df_unique[text_col].tolist(),
-        batch_size=batch_size,
-        show_progress_bar=show_progress_bar,
-        convert_to_tensor=False  # Return numpy arrays for efficiency
-    )
-    
-    # Create dictionary mapping id -> embedding
-    embedding_cache = dict(zip(
-        df_unique[id_col].astype(str),  # Convert IDs to string for consistency
-        embeddings
-    ))
-    
-    # Clean up
-    del model, embeddings
-    torch.cuda.empty_cache()
-    
-    print(f"✓ Embedding cache created: {len(embedding_cache)} entries")
-    print(f"Embedding dimension: {list(embedding_cache.values())[0].shape[0]}\n")
-    
-    return embedding_cache
-
 
 def add_embeddings_from_cache(
     df: pd.DataFrame,
@@ -997,6 +949,10 @@ def add_cosine_similarity_from_text(
         if id_col1 is None or id_col2 is None:
             raise ValueError("When using embedding_cache, must provide id_col1 and id_col2")
         
+        if len(df) == 0:
+            df[new_col] = pd.Series(dtype=float)
+            return df
+        
         print(f"Using pre-computed embeddings from cache...")
         
         # Add embeddings from cache
@@ -1016,6 +972,10 @@ def add_cosine_similarity_from_text(
         return df_out
     
     # ORIGINAL: Encode on-the-fly (legacy path for backward compatibility)
+    if len(df) == 0:
+        df[new_col] = pd.Series(dtype=float)
+        return df
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = SentenceTransformer(model_name, device=device)
     #Saves some RAM/VRAM
@@ -1731,10 +1691,10 @@ def add_graph_features(
         # 2. Bidirectional (Equivalence)
         # We take the geometric mean of the two path scores if both exist
         if dist_ab is not None and dist_ba is not None:
-             s_ba = decay ** (dist_ba - 1)
-             s_bidir = (s_fwd * s_ba) ** 0.5
+            s_ba = decay ** (dist_ba - 1)
+            s_bidir = (s_fwd * s_ba) ** 0.5
         else:
-             s_bidir = 0.0
+            s_bidir = 0.0
              
         fwd_scores.append(s_fwd)
         bidir_scores.append(s_bidir)
@@ -1916,15 +1876,25 @@ def compare_entailment_models(
             X = df_clean[feature_cols].values
             y_true = (df_clean[target_col] == positive_label).astype(int).values
             
-            # We use cross_val_predict to generate "clean" predictions for every row
-            # The model is trained on K-1 folds and predicts on the Kth fold.
-            y_probs = cross_val_predict(
-                pipeline, 
-                X, 
-                y_true, 
-                cv=5, 
-                method='predict_proba'
-            )[:, 1]
+            # Dynamically set CV folds based on minority class size
+            min_class_count = int(np.bincount(y_true).min()) if len(y_true) > 0 else 0
+            cv_folds = min(5, min_class_count)
+            
+            if cv_folds >= 2:
+                # We use cross_val_predict to generate "clean" predictions for every row
+                # The model is trained on K-1 folds and predicts on the Kth fold.
+                y_probs = cross_val_predict(
+                    pipeline, 
+                    X, 
+                    y_true, 
+                    cv=cv_folds, 
+                    method='predict_proba'
+                )[:, 1]
+            else:
+                # Too few samples for CV — use training predictions as fallback
+                pipeline.fit(X, y_true)
+                y_probs = pipeline.predict_proba(X)[:, 1]
+                print(f"  ⚠ Too few samples for CV ({len(y_true)} total, min class={min_class_count}). Using train predictions.")
 
             # 3. Calculate Metrics on these "Out-of-Sample" predictions
             roc_auc = roc_auc_score(y_true, y_probs)
@@ -2003,9 +1973,18 @@ def optimize_boosting_hyperparameters(
         
         model = HistGradientBoostingClassifier(**params)
         
-        # 3-Fold Cross-Validation for robustness
-        scores = cross_val_score(model, X, y, cv=3, scoring='roc_auc')
-        return scores.mean()
+        # Dynamically set CV folds based on minority class size
+        min_class_count = int(np.bincount(y).min()) if len(y) > 0 else 0
+        cv_folds = min(3, min_class_count)
+        
+        if cv_folds >= 2:
+            scores = cross_val_score(model, X, y, cv=cv_folds, scoring='roc_auc')
+            return scores.mean()
+        else:
+            # Too few samples for CV — fit and score on training data
+            model.fit(X, y)
+            y_probs = model.predict_proba(X)[:, 1]
+            return roc_auc_score(y, y_probs)
 
     print(f"Starting Optuna optimization with {n_trials} trials...")
     study = optuna.create_study(direction='maximize')
@@ -2236,104 +2215,6 @@ def find_best_thresholds(
         "thresholds_df":      thresholds_df,
         "best_taus_table":    best_taus_table,
     }
-
-
-def calculate_llm_savings_stats(
-    df: pd.DataFrame,
-    prob_col: str,
-    verdict_col: str,
-    threshold: float,
-    positive_label: str = "YES",
-    n_sample: int = 10000,
-    random_state: int = 42
-) -> Dict[str, Any]:
-    """
-    Calculates statistics for the "Send to LLM" decision logic.
-    
-    Logic:
-    1. Probability <= Threshold -> Auto-Reject (Predicted Not Entailed).
-       (The model says 'No' or 'Low Confidence', and we trust it to be No)
-    2. Probability > Threshold -> Send to LLM (Candidate for Entailment).
-       (The model says 'Maybe Yes', so we verify with LLM)
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Input dataframe.
-    prob_col : str
-        Probability column.
-    verdict_col : str
-        Ground truth column.
-    threshold : float
-        Threshold (tau).
-    positive_label : str, default "YES"
-        Label for positive class.
-    n_sample : int, default 10000
-        Sample size.
-    random_state : int, default 42
-        Random seed.
-
-    Returns
-    -------
-    dict
-        Dictionary of counts and stats.
-    """
-    # 1. Sample
-    if len(df) <= n_sample:
-        # print(f"Dataset size ({len(df)}) is smaller than requested sample ({n_sample}). Using full dataset.")
-        df_sub = df.copy()
-    else:
-        df_sub = df.sample(n=n_sample, random_state=random_state).copy()
-    
-    # 2. Logic
-    actual_pos = df_sub[verdict_col] == positive_label
-    actual_neg = ~actual_pos
-    probs = df_sub[prob_col]
-
-    # Zones
-    mask_sent = probs > threshold
-    mask_auto_reject = ~mask_sent # probs <= threshold
-
-    # Counts
-    # Sent to LLM (Model said > Tau)
-    Sent_Yes = (mask_sent & actual_pos).sum()      # Costly but Necessary (Verified Positive)
-    Sent_No  = (mask_sent & actual_neg).sum()      # Costly Validated (Verified Negative)
-    
-    # Auto-Reject (Model said <= Tau)
-    TN_rej = (mask_auto_reject & actual_neg).sum() # Good (Efficiency)
-    FN_rej = (mask_auto_reject & actual_pos).sum() # Bad  (Lost Opportunity)
-    
-    total = len(df_sub)
-    total_sent = Sent_Yes + Sent_No
-    
-    stats = {
-        "TN_AutoReject": int(TN_rej),
-        "FN_AutoReject": int(FN_rej),
-        "Sent_Yes": int(Sent_Yes),
-        "Sent_No": int(Sent_No),
-        "Total": int(total),
-        "Sent_Total": int(total_sent),
-        "Threshold": threshold
-    }
-    
-    # display report
-    print(f"\\n>>> Savings Analysis (Sample n={total})")
-    print(f"Threshold: Tau={threshold:.4f} (Send if > Tau)")
-    print("-" * 65)
-    print(f"{'Metric':<35} | {'Count':<10} | {'Rate':<10}")
-    print("-" * 65)
-    print(f"{'Auto-Reject (Correct)':<35} | {TN_rej:<10} | {TN_rej/total:.2%}")
-    print(f"{'Auto-Reject (Wrong - FN)':<35} | {FN_rej:<10} | {FN_rej/total:.2%}")
-    print(f"{'Sent to LLM (Actually Yes)':<35} | {Sent_Yes:<10} | {Sent_Yes/total:.2%}")
-    print(f"{'Sent to LLM (Actually No)':<35} | {Sent_No:<10} | {Sent_No/total:.2%}")
-    print("-" * 65)
-    
-    # LLM Workload Reduction
-    reduction = (total - total_sent) / total
-    print(f"LLM Calls: {total_sent} ({total_sent/total:.2%})")
-    print(f"LLM Savings: {total - total_sent} ({reduction:.2%})")
-    
-    return stats
 
 
 def plot_llm_savings_over_thresholds(
@@ -2665,7 +2546,8 @@ def generate_final_df(
     
     print(f"--- Generating LLM Batch ---")
     print(f"Original Count: {len(df):,}")
-    print(f"Filtered Count: {len(df_out):,} ({(len(df_out)/len(df)):.1%})")
+    pct = f"{(len(df_out)/len(df)):.1%}" if len(df) > 0 else "N/A"
+    print(f"Filtered Count: {len(df_out):,} ({pct})")
     print(f"Condition:      P > {threshold:.4f} (Send High Confidence Pairs)")
     
     return df_out
@@ -2759,8 +2641,12 @@ def add_verdict(
     print(f"VERDICT SUMMARY")
     print(f"{'='*70}")
     print(f"Total pairs: {n_total}")
-    print(f"Bidirectional entailment (YES): {n_yes} ({n_yes/n_total:.1%})")
-    print(f"Not bidirectionally entailed (NO): {n_total - n_yes} ({(n_total-n_yes)/n_total:.1%})")
+    if n_total > 0:
+        print(f"Bidirectional entailment (YES): {n_yes} ({n_yes/n_total:.1%})")
+        print(f"Not bidirectionally entailed (NO): {n_total - n_yes} ({(n_total-n_yes)/n_total:.1%})")
+    else:
+        print(f"Bidirectional entailment (YES): 0")
+        print(f"Not bidirectionally entailed (NO): 0")
     print(f"{'='*70}\n")
     
     return df_out
@@ -2816,16 +2702,21 @@ def calculate_entailment_ratio(
     >>> stats = calculate_entailment_ratio(df_to_llm)
     >>> print(f"Entailment ratio: {stats['entailment_ratio']:.1%}")
     """
-    # Load original LLM data and apply add_verdict to get bidirectional entailments
+    # Load original LLM data and get bidirectional verdicts.
+    # If 'verdict' column already exists (from process_llm_results_bidirectional),
+    # use it directly instead of recomputing with add_verdict.
     df_original = pd.read_csv(original_llm_file)
-    df_original_with_verdict = add_verdict(
-        df_original,
-        id1_col=id1_col,
-        id2_col=id2_col,
-        conclusion_col=conclusion_col,
-        positive_label=positive_label,
-        new_col='verdict'
-    )
+    if 'verdict' in df_original.columns and df_original['verdict'].notna().any():
+        df_original_with_verdict = df_original
+    else:
+        df_original_with_verdict = add_verdict(
+            df_original,
+            id1_col=id1_col,
+            id2_col=id2_col,
+            conclusion_col=conclusion_col,
+            positive_label=positive_label,
+            new_col='verdict'
+        )
     
     # Create a set of bidirectionally entailed pairs (verdict = YES)
     bidirectional_pairs = set()
@@ -2854,6 +2745,498 @@ def calculate_entailment_ratio(
         'bidirectionally_entailed': entailed_pairs_count,
         'entailment_ratio': entailment_ratio
     }
+
+
+# ================================================================
+# LLM LABELED PAIRS TRACKING & BIDIRECTIONAL PROCESSING
+# ================================================================
+
+def append_to_llm_labeled_pairs(
+    df_pairs: pd.DataFrame,
+    labeled_csv: str = "labeled_pairs/llm_labeled_pairs.csv",
+    id1_col: str = 'sentence_id_1',
+    id2_col: str = 'sentence_id_2',
+) -> pd.DataFrame:
+    """
+    Append pairs to the master LLM-labeled-pairs CSV.
+
+    Every pair we ever send to the LLM is recorded here so that
+    :func:`generate_valid_pairs` can exclude them in future rounds.
+    Duplicates (same id1, id2) are dropped.
+
+    Parameters
+    ----------
+    df_pairs : pd.DataFrame
+        New pairs to record.  Must contain ``id1_col`` and ``id2_col``.
+    labeled_csv : str
+        Path to the master CSV file (created if it doesn't exist).
+    id1_col, id2_col : str
+        Column names for the pair IDs.
+
+    Returns
+    -------
+    pd.DataFrame
+        The full accumulated labeled-pairs DataFrame.
+    """
+    os.makedirs(os.path.dirname(labeled_csv), exist_ok=True)
+
+    df_new = df_pairs[[id1_col, id2_col]].copy()
+    df_new = df_new.rename(columns={id1_col: 'sentence_id_1', id2_col: 'sentence_id_2'})
+
+    if os.path.exists(labeled_csv):
+        df_existing = pd.read_csv(labeled_csv)
+        df_all = pd.concat([df_existing, df_new], ignore_index=True)
+    else:
+        df_all = df_new
+
+    df_all = df_all.drop_duplicates(subset=['sentence_id_1', 'sentence_id_2'])
+    df_all.to_csv(labeled_csv, index=False)
+
+    print(f"✓ LLM labeled pairs updated: {len(df_all)} total in {labeled_csv}")
+    return df_all
+
+
+def process_one_way_results(
+    df_one_way: pd.DataFrame,
+    id1_col: str = 'sentence_id_1',
+    id2_col: str = 'sentence_id_2',
+    conclusion_col: str = 'llm_conclusion_12',
+    positive_label: str = 'YES',
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Process one-way LLM results into bidirectional verdicts.
+
+    Given a df with one-way entailment conclusions (A→B only), this
+    function identifies:
+
+    1. **Resolved pairs** – pairs where both (A,B) and (B,A) appear in
+       the df, so we can immediately determine the bidirectional verdict:
+       - Both YES  → add to results with verdict YES
+       - At least one NO → add to results with verdict NO
+    2. **Needs-reverse pairs** – pairs (A,B) that got YES but whose
+       reverse (B,A) is **not** in the current df.  These must be sent
+       back to the LLM for the second direction.
+
+    Pairs that got NO in the forward direction are automatically resolved
+    as NO (no need to check the reverse).
+
+    Parameters
+    ----------
+    df_one_way : pd.DataFrame
+        LLM results with one-way conclusions.
+    id1_col, id2_col : str
+        Column names for pair IDs.
+    conclusion_col : str
+        Column with the LLM conclusion (YES/NO).
+    positive_label : str
+        Value indicating entailment.
+
+    Returns
+    -------
+    (pd.DataFrame, pd.DataFrame)
+        ``(df_resolved, df_needs_reverse)``
+
+        - ``df_resolved``: pairs whose bidirectional verdict is known.
+          Has all original columns plus a ``verdict`` column.
+        - ``df_needs_reverse``: pairs that need to be sent to the LLM
+          in the reverse direction.  Contains the original row columns
+          plus ``reverse_id1`` and ``reverse_id2`` indicating which
+          direction to query.
+    """
+    df = df_one_way.copy()
+
+    # Build a lookup: (id1, id2) -> conclusion
+    pair_lookup = {}
+    for _, row in df.iterrows():
+        key = (str(row[id1_col]), str(row[id2_col]))
+        pair_lookup[key] = str(row[conclusion_col]).strip().upper()
+
+    resolved_rows = []
+    needs_reverse_rows = []
+
+    # Track pairs we've already resolved (via their sorted key) to avoid
+    # processing (A,B) and (B,A) separately when both appear in df.
+    resolved_sorted_keys = set()
+
+    for idx, row in df.iterrows():
+        a = str(row[id1_col])
+        b = str(row[id2_col])
+        fwd_conclusion = str(row[conclusion_col]).strip().upper()
+        sorted_key = tuple(sorted([a, b]))
+
+        if sorted_key in resolved_sorted_keys:
+            continue  # Already handled as part of the reverse pair
+
+        rev_key = (b, a)
+        rev_conclusion = pair_lookup.get(rev_key, None)
+
+        if fwd_conclusion != positive_label.upper():
+            # Forward is NO → pair is NO regardless of reverse
+            resolved_row = row.copy()
+            resolved_row['verdict'] = 'NO'
+            resolved_rows.append(resolved_row)
+            resolved_sorted_keys.add(sorted_key)
+        elif rev_conclusion is not None:
+            # Both directions exist in df
+            if rev_conclusion == positive_label.upper():
+                resolved_row = row.copy()
+                resolved_row['verdict'] = 'YES'
+                resolved_rows.append(resolved_row)
+            else:
+                resolved_row = row.copy()
+                resolved_row['verdict'] = 'NO'
+                resolved_rows.append(resolved_row)
+            resolved_sorted_keys.add(sorted_key)
+        else:
+            # Forward is YES but reverse doesn't exist → need to query LLM
+            needs_reverse_row = row.copy()
+            needs_reverse_row['reverse_id1'] = b
+            needs_reverse_row['reverse_id2'] = a
+            needs_reverse_rows.append(needs_reverse_row)
+            resolved_sorted_keys.add(sorted_key)
+
+    df_resolved = pd.DataFrame(resolved_rows)
+    df_needs_reverse = pd.DataFrame(needs_reverse_rows)
+
+    n_yes = (df_resolved['verdict'] == 'YES').sum() if len(df_resolved) > 0 else 0
+    n_no = (df_resolved['verdict'] == 'NO').sum() if len(df_resolved) > 0 else 0
+
+    print(f"\n{'='*60}")
+    print(f"ONE-WAY RESULTS PROCESSING")
+    print(f"{'='*60}")
+    print(f"Total input pairs: {len(df)}")
+    print(f"Resolved immediately: {len(df_resolved)} (YES={n_yes}, NO={n_no})")
+    print(f"Need reverse LLM call: {len(df_needs_reverse)}")
+    print(f"{'='*60}\n")
+
+    return df_resolved, df_needs_reverse
+
+
+def send_back_to_llm(
+    df_needs_reverse: pd.DataFrame,
+    df_clause: pd.DataFrame,
+    model: str = "deepseek-reasoner",
+    prompt_type: str = "test_prompt_tot_json2",
+    args_file: str = "ArgLevel_ClauseIds_df.xlsx",
+    output_dir: str = "labeled_pairs",
+    batch_label: str = "reverse_check",
+    save_every_n: int = 500,
+    deepseek_api_key: Optional[str] = None,
+    positive_label: str = 'YES',
+) -> pd.DataFrame:
+    """
+    Send the reverse direction of pairs to the LLM and combine results.
+
+    Takes pairs from :func:`process_one_way_results` that had YES in the
+    forward direction but whose reverse wasn't available, queries the LLM
+    for the reverse, and returns resolved bidirectional results.
+
+    Parameters
+    ----------
+    df_needs_reverse : pd.DataFrame
+        Output from :func:`process_one_way_results` with columns
+        ``reverse_id1``, ``reverse_id2``, plus the original pair columns.
+    df_clause : pd.DataFrame
+        Clause-level DataFrame with ``sentence_id`` and ``sentence`` (or
+        ``sentence_text``) columns, used to look up text for reverse pairs.
+    model : str
+        LLM model name.
+    prompt_type : str
+        Prompt template key.
+    args_file : str
+        Path to argument-level context Excel file.
+    output_dir : str
+        Directory for saving intermediate results.
+    batch_label : str
+        Label for intermediate files.
+    save_every_n : int
+        Save intermediate results every N pairs.
+    deepseek_api_key : str or None
+        API key (set as env var if provided).
+    positive_label : str
+        Value indicating entailment.
+
+    Returns
+    -------
+    pd.DataFrame
+        All reverse pairs with their bidirectional verdict resolved.
+        Has columns matching the original one-way results plus ``verdict``.
+    """
+    import sys
+
+    if len(df_needs_reverse) == 0:
+        print("No reverse pairs to send to LLM.")
+        return pd.DataFrame()
+
+    if deepseek_api_key:
+        os.environ["DEEPSEEK_API_KEY"] = deepseek_api_key
+
+    # Build the reverse-direction input DataFrame for the evaluator.
+    # The evaluator expects: sentence_id_1, sentence_id_2, sentence_text_1,
+    #   sentence_text_2, argument_id_1, argument_id_2
+    # We look up text from df_clause (keyed by sentence_id → sentence).
+    # Support both 'sentence' and 'sentence_text' column names.
+    text_col = 'sentence_text' if 'sentence_text' in df_clause.columns else 'sentence'
+    text_lookup = df_clause.set_index('sentence_id')[text_col].to_dict()
+
+    rev_id1 = df_needs_reverse['reverse_id1'].values
+    rev_id2 = df_needs_reverse['reverse_id2'].values
+
+    df_reverse_input = pd.DataFrame({
+        'sentence_id_1': rev_id1,
+        'sentence_id_2': rev_id2,
+        'sentence_text_1': [text_lookup.get(str(sid), '') for sid in rev_id1],
+        'sentence_text_2': [text_lookup.get(str(sid), '') for sid in rev_id2],
+    })
+
+    # Add argument IDs
+    df_reverse_input['argument_id_1'] = df_reverse_input['sentence_id_1'].apply(extract_argument_id)
+    df_reverse_input['argument_id_2'] = df_reverse_input['sentence_id_2'].apply(extract_argument_id)
+
+    # Save to temp CSV for evaluator
+    os.makedirs(output_dir, exist_ok=True)
+    reverse_input_csv = os.path.join(output_dir, f"{batch_label}_input.csv")
+    df_reverse_input.to_csv(reverse_input_csv, index=False)
+
+    # Also save intermediate LLM results every N pairs
+    intermediate_dir = os.path.join(output_dir, "llm_intermediates")
+    os.makedirs(intermediate_dir, exist_ok=True)
+
+    reverse_output_base = os.path.join(output_dir, f"{batch_label}_output")
+
+    print(f"\n{'='*60}")
+    print(f"SENDING {len(df_reverse_input)} REVERSE PAIRS TO LLM")
+    print(f"{'='*60}")
+    print(f"Model: {model}")
+    print(f"Input: {reverse_input_csv}")
+    print(f"Output: {reverse_output_base}.csv")
+
+    # Import and run the evaluator
+    import importlib
+    import llm_calls.deepseek_evaluator as etb
+    importlib.reload(etb)
+
+    sys.argv = [
+        "deepseek_evaluator.py",
+        "--model", model,
+        "--file", reverse_input_csv,
+        "--external", args_file,
+        "--prompt", prompt_type,
+        "--output", reverse_output_base,
+    ]
+
+    etb.main()
+    print(f"✓ Reverse LLM evaluation complete")
+
+    # Read reverse results
+    reverse_output_csv = f"{reverse_output_base}.csv"
+    df_reverse_results = pd.read_csv(reverse_output_csv)
+
+    # Record these in llm_labeled_pairs
+    append_to_llm_labeled_pairs(df_reverse_results)
+
+    # Now resolve: the forward was YES. If reverse is YES → verdict YES, else NO.
+    resolved_rows = []
+    reverse_lookup = {}
+    for _, row in df_reverse_results.iterrows():
+        key = (str(row['sentence_id_1']), str(row['sentence_id_2']))
+        conclusion = str(row.get('llm_conclusion_12', '')).strip().upper()
+        reverse_lookup[key] = conclusion
+
+    for _, orig_row in df_needs_reverse.iterrows():
+        rev_id1 = str(orig_row['reverse_id1'])
+        rev_id2 = str(orig_row['reverse_id2'])
+        rev_conclusion = reverse_lookup.get((rev_id1, rev_id2), 'NO')
+
+        result_row = orig_row.drop(labels=['reverse_id1', 'reverse_id2'], errors='ignore').copy()
+        if rev_conclusion == positive_label.upper():
+            result_row['verdict'] = 'YES'
+        else:
+            result_row['verdict'] = 'NO'
+        resolved_rows.append(result_row)
+
+    df_final_resolved = pd.DataFrame(resolved_rows)
+
+    n_yes = (df_final_resolved['verdict'] == 'YES').sum() if len(df_final_resolved) > 0 else 0
+    n_no = (df_final_resolved['verdict'] == 'NO').sum() if len(df_final_resolved) > 0 else 0
+
+    print(f"\n{'='*60}")
+    print(f"REVERSE RESULTS SUMMARY")
+    print(f"{'='*60}")
+    print(f"Total reverse pairs resolved: {len(df_final_resolved)}")
+    print(f"  Bidirectional YES: {n_yes}")
+    print(f"  Bidirectional NO:  {n_no}")
+    print(f"{'='*60}\n")
+
+    return df_final_resolved
+
+
+def process_llm_results_bidirectional(
+    df_one_way: pd.DataFrame,
+    df_clause: pd.DataFrame,
+    results_output_path: str,
+    model: str = "deepseek-reasoner",
+    prompt_type: str = "test_prompt_tot_json2",
+    args_file: str = "ArgLevel_ClauseIds_df.xlsx",
+    output_dir: str = "labeled_pairs",
+    batch_label: str = "reverse_check",
+    save_every_n: int = 500,
+    deepseek_api_key: Optional[str] = None,
+    labeled_csv: str = "labeled_pairs/llm_labeled_pairs.csv",
+    max_reverse_pairs: int = 100_000,
+) -> pd.DataFrame:
+    """
+    Full pipeline: take one-way LLM results, resolve bidirectional verdicts,
+    send reverse queries as needed, save everything.
+
+    Steps:
+    1. Record all input pairs in ``llm_labeled_pairs.csv``.
+    2. Process one-way results to find resolved and needs-reverse pairs.
+    3. Send reverse pairs to LLM (capped at ``max_reverse_pairs``).
+    4. Record reverse pairs in ``llm_labeled_pairs.csv``.
+    5. Combine all resolved pairs and save to ``results_output_path``.
+
+    Parameters
+    ----------
+    df_one_way : pd.DataFrame
+        Raw one-way LLM output.
+    df_clause : pd.DataFrame
+        Clause-level DataFrame with ``sentence_id`` and ``sentence`` (or
+        ``sentence_text``) columns, used to look up text for reverse pairs.
+    results_output_path : str
+        Where to save the final bidirectional results CSV.
+    model, prompt_type, args_file, output_dir, batch_label, save_every_n
+        Passed to :func:`send_back_to_llm`.
+    deepseek_api_key : str or None
+        API key.
+    labeled_csv : str
+        Path to master labeled-pairs CSV.
+    max_reverse_pairs : int
+        Cap on reverse pairs to send to LLM per call.
+
+    Returns
+    -------
+    pd.DataFrame
+        Final bidirectional results DataFrame.
+    """
+    # Step 1: Record all one-way pairs in llm_labeled_pairs
+    append_to_llm_labeled_pairs(df_one_way, labeled_csv=labeled_csv)
+
+    # Step 2: Separate resolved vs needs-reverse
+    df_resolved, df_needs_reverse = process_one_way_results(df_one_way)
+
+    # Step 2.5: Filter out reverse pairs that were already sent to LLM
+    # IMPORTANT: Use DIRECTIONAL check — (B,A) is only "already labeled" if
+    # (B,A) itself was sent, NOT if (A,B) was sent (entailment is directional).
+    if len(df_needs_reverse) > 0 and 'reverse_id1' in df_needs_reverse.columns:
+        before = len(df_needs_reverse)
+        if os.path.exists(labeled_csv):
+            df_labeled_master = pd.read_csv(labeled_csv)
+            # Build set of directional (id1, id2) pairs already sent
+            labeled_directional = set(
+                zip(df_labeled_master['sentence_id_1'].astype(str),
+                    df_labeled_master['sentence_id_2'].astype(str))
+            )
+            # Only remove reverse pairs where (B,A) was ALREADY sent as (B,A)
+            df_needs_reverse = df_needs_reverse[
+                ~df_needs_reverse.apply(
+                    lambda r: (str(r['reverse_id1']), str(r['reverse_id2'])) in labeled_directional,
+                    axis=1
+                )
+            ].copy()
+            removed = before - len(df_needs_reverse)
+            if removed > 0:
+                print(f"✓ Filtered {removed} reverse pairs already sent (directional check)")
+
+    # Step 3: Send reverse pairs to LLM (with cap)
+    if len(df_needs_reverse) > max_reverse_pairs:
+        print(f"⚠ Capping reverse pairs from {len(df_needs_reverse)} to {max_reverse_pairs}")
+        df_needs_reverse = df_needs_reverse.head(max_reverse_pairs)
+
+    if len(df_needs_reverse) > 0:
+        df_reverse_resolved = send_back_to_llm(
+            df_needs_reverse,
+            df_clause=df_clause,
+            model=model,
+            prompt_type=prompt_type,
+            args_file=args_file,
+            output_dir=output_dir,
+            batch_label=batch_label,
+            save_every_n=save_every_n,
+            deepseek_api_key=deepseek_api_key,
+        )
+    else:
+        df_reverse_resolved = pd.DataFrame()
+
+    # Step 4: Combine all resolved pairs
+    all_resolved = pd.concat([df_resolved, df_reverse_resolved], ignore_index=True)
+
+    # Step 5: Save to results file
+    os.makedirs(os.path.dirname(results_output_path), exist_ok=True)
+    all_resolved.to_csv(results_output_path, index=False)
+
+    n_yes = (all_resolved['verdict'] == 'YES').sum() if len(all_resolved) > 0 else 0
+    n_no = (all_resolved['verdict'] == 'NO').sum() if len(all_resolved) > 0 else 0
+
+    print(f"\n{'='*60}")
+    print(f"BIDIRECTIONAL PROCESSING COMPLETE")
+    print(f"{'='*60}")
+    print(f"Total resolved pairs: {len(all_resolved)}")
+    print(f"  YES (bidirectional): {n_yes}")
+    print(f"  NO:                  {n_no}")
+    print(f"Saved to: {results_output_path}")
+    print(f"{'='*60}\n")
+
+    return all_resolved
+
+
+def filter_already_labeled(
+    df_pairs: pd.DataFrame,
+    labeled_csv: str = "labeled_pairs/llm_labeled_pairs.csv",
+    id1_col: str = 'id1',
+    id2_col: str = 'id2',
+) -> pd.DataFrame:
+    """
+    Remove pairs from ``df_pairs`` that already appear in the master
+    LLM-labeled-pairs CSV. Checks both directions: (A,B) and (B,A).
+
+    Parameters
+    ----------
+    df_pairs : pd.DataFrame
+        Candidate pairs to filter.
+    labeled_csv : str
+        Path to the master labeled-pairs CSV.
+    id1_col, id2_col : str
+        Column names for pair IDs in ``df_pairs``.
+
+    Returns
+    -------
+    pd.DataFrame
+        Filtered DataFrame with already-labeled pairs removed.
+    """
+    if not os.path.exists(labeled_csv):
+        print(f"No labeled pairs file found at {labeled_csv} — no filtering applied.")
+        return df_pairs
+
+    df_labeled = pd.read_csv(labeled_csv)
+
+    # Build a set of sorted pair keys from the labeled file
+    labeled_keys = set()
+    for _, row in df_labeled.iterrows():
+        key = tuple(sorted([str(row['sentence_id_1']), str(row['sentence_id_2'])]))
+        labeled_keys.add(key)
+
+    # Filter out pairs that are already labeled
+    mask = df_pairs.apply(
+        lambda row: tuple(sorted([str(row[id1_col]), str(row[id2_col])])) not in labeled_keys,
+        axis=1,
+    )
+    df_filtered = df_pairs[mask].copy()
+
+    removed = len(df_pairs) - len(df_filtered)
+    print(f"Filtered out {removed:,} already-labeled pairs (kept {len(df_filtered):,} of {len(df_pairs):,})")
+
+    return df_filtered
 
 
 # ================================================================
@@ -2973,6 +3356,15 @@ def run_fea_papermill(
     import scrapbook as sb
 
     os.makedirs(temp_dir, exist_ok=True)
+
+    # Short-circuit: if df_candidates or df_obs_ent are empty, there's nothing
+    # for FreeEntailmentAlgorithm to train on — return empty results immediately.
+    if len(df_candidates) == 0 or len(df_obs_ent) == 0:
+        print(f"⚠ Skipping FreeEntailmentAlgorithm (empty data: "
+              f"{len(df_candidates)} candidates, {len(df_obs_ent)} entailed pairs)")
+        df_final = pd.DataFrame(columns=['id1', 'id2', 'text1', 'text2', 'entailment_probability'])
+        fig_html = "<p>No data for this iteration</p>"
+        return df_final, fig_html
 
     df_candidates.to_pickle(f"{temp_dir}/df_candidates.pkl")
     df_crossed.to_pickle(f"{temp_dir}/df_crossed.pkl")
@@ -3166,6 +3558,9 @@ def finalize_pipeline_iteration(
         df_to_llm.to_csv(output_csv, index=False)
         print(f"✓ Saved {len(df_to_llm)} pairs to {output_csv} for LLM processing")
 
+        # Track in llm_labeled_pairs
+        append_to_llm_labeled_pairs(df_to_llm)
+
         sent_pairs = set(zip(df_to_llm['sentence_id_1'], df_to_llm['sentence_id_2']))
         mask = unlabeled_pairs.apply(
             lambda row: (row['id1'], row['id2']) not in sent_pairs,
@@ -3204,12 +3599,20 @@ def run_fea_loop(
     remaining_llm_calls: Optional[pd.DataFrame] = None,
     unlabeled_pairs: Optional[pd.DataFrame] = None,
     deepseek_api_key: Optional[str] = None,
+    budget_dollars: Optional[float] = None,
+    cost_per_1k_pairs: float = 2.0,
 ) -> List[dict]:
     """
     Run the full FEA iterative loop.
 
     Each iteration executes ``FEA_Pipeline.ipynb`` via papermill, and
     optionally runs the LLM evaluator notebook in production mode.
+
+    The loop runs until one of three stopping conditions is met:
+
+    1. ``num_iterations`` iterations have been completed.
+    2. ``budget_dollars`` has been exhausted (production mode only).
+    3. The unlabeled pool is empty.
 
     Parameters
     ----------
@@ -3222,7 +3625,7 @@ def run_fea_loop(
     embedding_cache : dict
         Pre-computed embedding cache.
     num_iterations : int
-        How many loop iterations to run.
+        Maximum loop iterations to run (hard cap).
     start_iteration : int
         Starting iteration index.
     output_dir : str
@@ -3237,6 +3640,13 @@ def run_fea_loop(
         Unlabeled pairs for production mode.
     deepseek_api_key : str or None
         API key set as ``DEEPSEEK_API_KEY`` env var in production mode.
+    budget_dollars : float or None
+        Maximum dollar amount to spend on LLM calls.  When the cumulative
+        cost reaches or exceeds this value the loop stops *before*
+        starting a new iteration.  ``None`` means unlimited.
+    cost_per_1k_pairs : float
+        Estimated cost in dollars per 1,000 pairs sent to the LLM.
+        Default is ``2.0`` ($2 / 1 k pairs).
 
     Returns
     -------
@@ -3259,9 +3669,9 @@ def run_fea_loop(
         raise ValueError(f"input_file has unexpected type: {type(input_file)}")
 
     if test:
-        actual_initial_unlabeled = len(remaining_llm_calls)
+        actual_initial_unlabeled = len(remaining_llm_calls) if remaining_llm_calls is not None else 0
     else:
-        actual_initial_unlabeled = len(unlabeled_pairs)
+        actual_initial_unlabeled = len(unlabeled_pairs) if unlabeled_pairs is not None else 0
 
     print(f"Initial labeled pairs: {actual_initial_labeled}")
     print(f"Initial unlabeled pairs: {actual_initial_unlabeled}")
@@ -3281,15 +3691,37 @@ def run_fea_loop(
     print(f"Unlabeled pool: {unlabeled_pool}")
     print(f"Total pairs: {total_pairs}")
 
+    cost_per_pair = cost_per_1k_pairs / 1000.0
+    cost_spent = 0.0
+
+    if budget_dollars is not None:
+        print(f"Budget: ${budget_dollars:,.2f}  (${cost_per_1k_pairs:.2f} / 1k pairs)")
+    else:
+        print("Budget: unlimited")
+
     labeled_pairs_dir = "labeled_pairs"
     os.makedirs(labeled_pairs_dir, exist_ok=True)
 
     # --- Main loop ---
     for iteration in range(start_iteration, num_iterations + 1):
+        # --- Budget gate: stop before starting a new iteration if budget exhausted ---
+        if budget_dollars is not None and cost_spent >= budget_dollars:
+            print(f"\n{'='*60}")
+            print(f"BUDGET EXHAUSTED  (${cost_spent:,.2f} / ${budget_dollars:,.2f})")
+            print(f"Stopping before iteration {iteration}.")
+            print(f"{'='*60}")
+            break
+
+        remaining_budget_str = (
+            f"${budget_dollars - cost_spent:,.2f} remaining"
+            if budget_dollars is not None
+            else "unlimited"
+        )
         print(f"\n{'='*60}")
         print(f"ITERATION {iteration}/{num_iterations}")
         print(f"{'='*60}")
         print(f"Status: Labeled={cumulative_labeled}, Unlabeled={unlabeled_pool}, Total={total_pairs}")
+        print(f"Cost so far: ${cost_spent:,.2f}  ({remaining_budget_str})")
 
         unlabeled_available = unlabeled_pool
 
@@ -3346,6 +3778,10 @@ def run_fea_loop(
             if os.path.exists(output_csv):
                 df_new_pairs = pd.read_csv(output_csv)
 
+                if len(df_new_pairs) == 0:
+                    print(f"\n⚠ No new pairs in output this iteration — stopping.")
+                    break
+
                 if isinstance(input_file, str):
                     df_existing = pd.read_csv(input_file)
                 else:
@@ -3371,11 +3807,19 @@ def run_fea_loop(
             print(f"  Shape: {df_to_llm_retrieved.shape}")
             print(f"  Columns: {list(df_to_llm_retrieved.columns)}")
 
+            if len(df_to_llm_retrieved) == 0:
+                print(f"\n⚠ No pairs selected for LLM this iteration (empty df_to_llm).")
+                print(f"  This usually means too few entailed pairs — skipping LLM call.")
+                break
+
             df_to_llm_file = f"{loop_data_dir}/df_to_llm_iter_{iteration}.csv"
             df_to_llm_retrieved.to_csv(df_to_llm_file, index=False)
             print(f"✓ Saved df_to_llm to {df_to_llm_file}")
 
             next_input_file = f"{labeled_pairs_dir}/Results_DS_BtoS_iteration_{iteration + 1}.csv"
+
+            # --- Step 1: Send forward-direction pairs to LLM ---
+            one_way_output = f"{labeled_pairs_dir}/Results_DS_BtoS_iteration_{iteration + 1}_one_way"
 
             evaluator_notebook = os.path.join(output_dir, f"Evaluator_iter_{iteration}.ipynb")
             evaluator_params = {
@@ -3383,12 +3827,12 @@ def run_fea_loop(
                 'input_file': df_to_llm_file,
                 'args_file': "ArgLevel_ClauseIds_df.xlsx",
                 'prompt': "test_prompt_tot_json2",
-                'output': next_input_file,
-                'previous_input_file': input_csv_path,
+                'output': one_way_output,
+                'previous_input_file': '',  # Don't merge with previous yet
             }
 
             print(f"\n{'='*60}")
-            print(f"EXECUTING LLM EVALUATOR")
+            print(f"EXECUTING LLM EVALUATOR (forward direction)")
             print(f"{'='*60}")
             print(f"Sending {len(df_to_llm_retrieved)} pairs to LLM...")
 
@@ -3400,9 +3844,37 @@ def run_fea_loop(
                 evaluator_notebook,
                 parameters=evaluator_params,
             )
+            print(f"✓ Forward LLM evaluation complete")
 
-            print(f"✓ LLM evaluation complete")
-            print(f"✓ Merged results saved to {next_input_file}")
+            # --- Step 2: Process one-way results bidirectionally ---
+            one_way_csv = f"{one_way_output}.csv"
+            if os.path.exists(one_way_csv):
+                df_one_way = pd.read_csv(one_way_csv)
+            else:
+                print(f"⚠ ERROR: One-way output not found: {one_way_csv}")
+                break
+
+            df_bidirectional = process_llm_results_bidirectional(
+                df_one_way=df_one_way,
+                df_clause=df_clause,
+                results_output_path=next_input_file,
+                model="deepseek-reasoner",
+                prompt_type="test_prompt_tot_json2",
+                args_file="ArgLevel_ClauseIds_df.xlsx",
+                output_dir=labeled_pairs_dir,
+                batch_label=f"reverse_iter_{iteration}",
+                deepseek_api_key=deepseek_api_key,
+                max_reverse_pairs=100_000,
+            )
+
+            # --- Step 3: Merge with previous accumulated results ---
+            if os.path.exists(input_csv_path):
+                df_prev = pd.read_csv(input_csv_path)
+                df_merged = pd.concat([df_prev, df_bidirectional], ignore_index=True)
+                df_merged.to_csv(next_input_file, index=False)
+                print(f"✓ Merged {len(df_prev)} previous + {len(df_bidirectional)} new = {len(df_merged)} total")
+            else:
+                df_bidirectional.to_csv(next_input_file, index=False)
 
             if os.path.exists(next_input_file):
                 input_file = next_input_file
@@ -3417,6 +3889,10 @@ def run_fea_loop(
 
         cumulative_labeled += pairs_selected
         unlabeled_pool -= pairs_selected
+
+        # Track cost (forward + any reverse pairs sent to LLM)
+        iteration_cost = pairs_selected * cost_per_pair
+        cost_spent += iteration_cost
 
         if cumulative_labeled + unlabeled_pool != total_pairs:
             print(f"⚠ WARNING: Total pairs mismatch! {cumulative_labeled} + {unlabeled_pool} != {total_pairs}")
@@ -3454,10 +3930,13 @@ def run_fea_loop(
             'unlabeled_remaining': unlabeled_remaining,
             'output_file': output_csv if test else next_input_file,
             'entailment_ratio': entailment_ratio,
+            'iteration_cost': iteration_cost,
+            'cumulative_cost': cost_spent,
         })
 
         print(f"  → Labeled input: {cumulative_labeled - pairs_selected}")
         print(f"  → Unlabeled available: {unlabeled_available}")
+        print(f"  → Iteration cost: ${iteration_cost:,.2f}  (cumulative: ${cost_spent:,.2f})")
 
     print(f"\n{'='*60}")
     print("FEA Loop Complete!")
@@ -3469,7 +3948,7 @@ def run_fea_loop(
 def save_iteration_stats(
     iteration_stats: List[dict],
     output_dir: str,
-    cost_per_pair: float = 0.0019,
+    cost_per_pair: float = 0.002,
 ) -> pd.DataFrame:
     """
     Print and save iteration statistics with cost summary.
@@ -3481,7 +3960,8 @@ def save_iteration_stats(
     output_dir : str
         Directory in which to save ``iteration_stats.csv``.
     cost_per_pair : float
-        Estimated cost per pair sent to the LLM.
+        Fallback cost per pair (used only if iteration dicts lack
+        ``cumulative_cost``).
 
     Returns
     -------
@@ -3493,14 +3973,18 @@ def save_iteration_stats(
     print(stats_df)
 
     total_pairs_sent = stats_df['pairs_selected'].sum()
-    total_cost = total_pairs_sent * cost_per_pair
+
+    # Use tracked cost if available, else fall back to simple estimate
+    if 'cumulative_cost' in stats_df.columns and len(stats_df) > 0:
+        total_cost = stats_df['cumulative_cost'].iloc[-1]
+    else:
+        total_cost = total_pairs_sent * cost_per_pair
 
     print(f"\n{'='*60}")
     print("COST SUMMARY")
     print(f"{'='*60}")
-    print(f"Total pairs sent to LLM: {total_pairs_sent}")
-    print(f"Cost per pair: ${cost_per_pair:.6f}")
-    print(f"Total cost: ${total_cost:.4f}")
+    print(f"Total pairs sent to LLM: {total_pairs_sent:,}")
+    print(f"Total cost: ${total_cost:,.2f}")
     print(f"{'='*60}")
 
     stats_df['total_cost'] = total_cost

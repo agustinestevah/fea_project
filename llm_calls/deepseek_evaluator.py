@@ -1,21 +1,26 @@
 import argparse
 import json
 import os
-import statistics
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pydantic import ValidationError
 
-import numpy as np
-import openai
 import pandas as pd
 from openai import OpenAI
 from pydantic import BaseModel
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 from tqdm import tqdm
-from typing import Dict, List, Optional
+from typing import Optional
 
-from prompts import *
+# Support both package import (from llm_calls.prompts) and standalone import (from prompts)
+try:
+    from llm_calls.prompts import *
+except ImportError:
+    current_dir = os.getcwd()
+    if current_dir not in sys.path:
+        sys.path.insert(0, current_dir)
+    from prompts import *
 
 class ResponseSchema(BaseModel):
     sentence_id_1: str # ids of the sentences being compared
@@ -149,7 +154,7 @@ class EntailmentEvaluator:
             time.sleep(2)
             return {"ERROR": f"API call failed: {str(e)}"}
 
-def batch_process_pairs(evaluator, data: pd.DataFrame, data_args: pd.DataFrame, path_intermediate: str, batch_size: int = 10000, workers: int = 100):
+def batch_process_pairs(evaluator, data: pd.DataFrame, data_args: pd.DataFrame, path_intermediate: str, batch_size: int = 1, workers: int = 100):
     """
     Process multiple sentence pairs in parallel, collect the results, and export progress every N results.
     
@@ -169,9 +174,8 @@ def batch_process_pairs(evaluator, data: pd.DataFrame, data_args: pd.DataFrame, 
     results_separate = []  # List to store all results
     futures = []
     
-    # File tracking the most recent two intermediate CSV files
+    # Track the most recently saved intermediate file for cleanup
     last_saved_file = None
-    previous_saved_file = None
 
     # Set up thread pool for parallel processing
     with ThreadPoolExecutor(max_workers=workers) as executor:  # Adjust workers based on available resources
@@ -239,8 +243,7 @@ def batch_process_pairs(evaluator, data: pd.DataFrame, data_args: pd.DataFrame, 
                     print(f"Deleting previous file: {last_saved_file}")
                     os.remove(last_saved_file)
 
-                # Update the tracking variables
-                previous_saved_file = last_saved_file
+                # Update the tracking variable
                 last_saved_file = current_file
 
     return results_separate
