@@ -9,6 +9,60 @@ from torch.utils.data import DataLoader
 from collections import defaultdict
 from typing import List, Tuple, Any, Mapping, Iterable, Dict, Literal, Union, Optional
 import plotly.graph_objects as go
+import gc
+
+
+# ================================================================
+# SEEN-INDEX HELPERS  (used by generate_valid_pairs for cross-round
+# tracking of already-consumed pair indices)
+# ================================================================
+
+def _load_seen(path: str) -> np.ndarray:
+    """Load a sorted int64 numpy array from *path*, or return empty."""
+    if os.path.exists(path):
+        arr = np.load(path)
+        return np.sort(arr.astype(np.int64))
+    return np.array([], dtype=np.int64)
+
+
+def _save_seen(path: str, indices: np.ndarray) -> None:
+    """Save a sorted int64 numpy array to *path*."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    np.save(path, np.sort(indices.astype(np.int64)))
+
+
+def _sample_excluding(
+    rng: np.random.Generator,
+    universe_size: int,
+    excluded_sorted: np.ndarray,
+    sample_size: int,
+) -> np.ndarray:
+    """
+    Sample *sample_size* unique indices from ``[0, universe_size)``
+    **excluding** the indices in *excluded_sorted* (must be sorted).
+
+    Uses an iterative search-sorted offset correction that converges
+    in O(log(M/N)) steps where M = len(excluded).
+    """
+    n_available = universe_size - len(excluded_sorted)
+    if n_available <= 0:
+        return np.array([], dtype=np.int64)
+    if sample_size > n_available:
+        sample_size = n_available
+
+    # Sample from the "compressed" space [0, n_available)
+    compressed = np.sort(rng.choice(n_available, size=sample_size, replace=False))
+
+    # Map to original space via iterative offset correction
+    expanded = compressed.astype(np.int64)
+    for _ in range(50):  # usually converges in 2-3 iterations
+        offsets = np.searchsorted(excluded_sorted, expanded, side='right')
+        new_expanded = (compressed + offsets).astype(np.int64)
+        if np.array_equal(new_expanded, expanded):
+            break
+        expanded = new_expanded
+
+    return expanded
 
 
 # Sklearn imports for the regression/prediction steps
@@ -39,6 +93,7 @@ def generate_valid_pairs(
     sample_n_bs: Optional[int] = None,
     top_k_bs: Optional[int] = None,
     exclude_labeled_csv: Optional[str] = "labeled_pairs/llm_labeled_pairs.csv",
+    seen_indices_dir: Optional[str] = None,
 ) -> pd.DataFrame:
     """
     Generate valid pairwise combinations from premise and conclusion dataframes.
@@ -107,13 +162,22 @@ def generate_valid_pairs(
         Path to a CSV of already-labeled pairs (``sentence_id_1``,
         ``sentence_id_2``).  Any matching pairs are removed from the
         output.  Set to ``None`` to disable filtering.
+    seen_indices_dir : str or None, default=None
+        Directory for persisting consumed linear-index files across rounds.
+        When set, each call loads previously consumed indices so the same
+        pair is never generated twice, even across separate invocations.
+        Four files are maintained (one per segment):
+        ``{dir}/seen_premises_bb.npy``, ``seen_premises_bs.npy``,
+        ``seen_conclusions_bb.npy``, ``seen_conclusions_bs.npy``.
+        Set to ``None`` to disable (original behaviour).
     
     Returns
     -------
     pd.DataFrame
-        DataFrame with columns ``['id1', 'id2', 'text1', 'text2']`` (random
-        sampling mode) **or** ``['id1', 'id2', 'text1', 'text2', 'cosine_sim',
-        'pair_type']`` (threshold-filtered mode).
+        DataFrame with columns ``['id1', 'id2']`` (random sampling mode)
+        **or** ``['id1', 'id2', 'cosine_sim', 'pair_type']``
+        (threshold-filtered mode).  Text columns are NOT included;
+        look them up on demand via ``df_clause`` when needed.
     """
     np.random.seed(random_seed)
     
@@ -326,88 +390,211 @@ def generate_valid_pairs(
     # ================================================================
     # ORIGINAL PATH  (random sampling, no thresholds)
     # ================================================================
-    def create_pairs_within_df(df: pd.DataFrame, id_col: str, target_sample_size: int = None) -> pd.DataFrame:
-        """Create randomly sampled pairwise combinations within a dataframe, excluding Speech-Speech."""
+    def create_pairs_within_df(
+        df: pd.DataFrame,
+        id_col: str,
+        target_sample_size: int = None,
+        group_label: str = '',
+    ) -> pd.DataFrame:
+        """Create randomly sampled pairwise combinations within a dataframe,
+        excluding Speech-Speech.  Supports cross-round seen-index tracking
+        via ``seen_indices_dir`` (captured from the outer scope).
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            Source rows (premises or conclusions).
+        id_col : str
+            Column with sentence IDs.
+        target_sample_size : int or None
+            How many pairs to sample.  ``None`` → generate all.
+        group_label : str
+            E.g. ``'premises'`` or ``'conclusions'``.  Used to
+            namespace the ``.npy`` seen-index files.
+        """
         ids = df[id_col].tolist()
         n = len(ids)
-        
+
         # Categorize IDs by source type
         book_indices = [i for i, id_ in enumerate(ids) if get_source_type(id_) == 'B']
         speech_indices = [i for i, id_ in enumerate(ids) if get_source_type(id_) == 'S']
-        
+
         n_book = len(book_indices)
         n_speech = len(speech_indices)
-        
-        # Possible pairs: Book-Book + Book-Speech (Speech-Speech excluded)
-        max_possible_pairs = (n_book * (n_book - 1)) // 2 + (n_book * n_speech)
-        
+
+        book_book_max = n_book * (n_book - 1) // 2
+        book_speech_max = n_book * n_speech
+        max_possible_pairs = book_book_max + book_speech_max
+
         print(f"  Dataset size: {n} ({n_book} books, {n_speech} speeches)")
         print(f"  Max possible valid pairs: {max_possible_pairs:,}")
-        
+
+        # Vectorised ID arrays for fast indexing
+        book_id_arr = np.array([ids[i] for i in book_indices])
+        speech_id_arr = (np.array([ids[i] for i in speech_indices])
+                         if speech_indices else np.array([], dtype=object))
+        rng = np.random.default_rng(random_seed)
+
+        # --- Load previously seen indices (if tracking enabled) ---
+        seen_bb = np.array([], dtype=np.int64)
+        seen_bs = np.array([], dtype=np.int64)
+        if seen_indices_dir and group_label:
+            bb_path = os.path.join(seen_indices_dir, f"seen_{group_label}_bb.npy")
+            bs_path = os.path.join(seen_indices_dir, f"seen_{group_label}_bs.npy")
+            seen_bb = _load_seen(bb_path)
+            seen_bs = _load_seen(bs_path)
+            bb_avail = book_book_max - len(seen_bb)
+            bs_avail = book_speech_max - len(seen_bs)
+            print(f"  Seen-index tracking: {len(seen_bb):,} BB + "
+                  f"{len(seen_bs):,} BS already consumed "
+                  f"({bb_avail:,} BB + {bs_avail:,} BS remaining)")
+
+        # ---- helper: convert BB linear indices → (i, j) ----
+        def _lin_to_bb(lin_idx):
+            nn = n_book
+            ii = (nn - 0.5 - np.sqrt((nn - 0.5)**2 - 2.0 * lin_idx)).astype(np.int64)
+            jj = (lin_idx - ii * (2 * nn - ii - 1) // 2 + ii + 1).astype(np.int64)
+            return ii, jj
+
         if target_sample_size is None or target_sample_size >= max_possible_pairs:
-            # Generate all valid pairs
+            # ---- Generate ALL valid pairs (vectorised) ----
+            # When seen-index tracking is on, exclude previously consumed
             print(f"  Generating all {max_possible_pairs:,} pairs...")
-            pairs = []
-            
-            # Book-Book pairs
-            for i in range(len(book_indices)):
-                for j in range(i + 1, len(book_indices)):
-                    idx1, idx2 = book_indices[i], book_indices[j]
-                    pairs.append({'id1': ids[idx1], 'id2': ids[idx2]})
-            
-            # Book-Speech pairs
-            for b_idx in book_indices:
-                for s_idx in speech_indices:
-                    pairs.append({'id1': ids[b_idx], 'id2': ids[s_idx]})
-            
-            return pd.DataFrame(pairs)
+            parts = []
+            new_bb_idx = np.array([], dtype=np.int64)
+            new_bs_idx = np.array([], dtype=np.int64)
+
+            if n_book >= 2:
+                if len(seen_bb) > 0:
+                    all_bb = np.arange(book_book_max, dtype=np.int64)
+                    mask = np.ones(book_book_max, dtype=bool)
+                    mask[seen_bb[seen_bb < book_book_max]] = False
+                    fresh_bb = all_bb[mask]
+                    del all_bb, mask
+                else:
+                    fresh_bb = np.arange(book_book_max, dtype=np.int64)
+                ii, jj = _lin_to_bb(fresh_bb)
+                new_bb_idx = fresh_bb
+                parts.append(pd.DataFrame({'id1': book_id_arr[ii], 'id2': book_id_arr[jj]}))
+                del ii, jj, fresh_bb
+
+            if n_book > 0 and n_speech > 0:
+                if len(seen_bs) > 0:
+                    all_bs = np.arange(book_speech_max, dtype=np.int64)
+                    mask = np.ones(book_speech_max, dtype=bool)
+                    mask[seen_bs[seen_bs < book_speech_max]] = False
+                    fresh_bs = all_bs[mask]
+                    del all_bs, mask
+                else:
+                    fresh_bs = np.arange(book_speech_max, dtype=np.int64)
+                b_idx = fresh_bs // n_speech
+                s_idx = fresh_bs % n_speech
+                new_bs_idx = fresh_bs
+                parts.append(pd.DataFrame({'id1': book_id_arr[b_idx],
+                                           'id2': speech_id_arr[s_idx]}))
+                del b_idx, s_idx, fresh_bs
+
+            # Persist newly consumed indices
+            if seen_indices_dir and group_label:
+                _save_seen(bb_path, np.union1d(seen_bb, new_bb_idx))
+                _save_seen(bs_path, np.union1d(seen_bs, new_bs_idx))
+
+            return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=['id1', 'id2'])
         else:
-            # Efficient random sampling using sets
+            # ---- Vectorised random sampling (scales to tens of millions) ----
             print(f"  Sampling {target_sample_size:,} pairs from {max_possible_pairs:,} possible...")
-            
-            seen_pairs = set()
-            pairs_list = []
-            
-            # Calculate how many pairs to sample from each category
-            book_book_max = (n_book * (n_book - 1)) // 2
-            book_speech_max = n_book * n_speech
-            
-            # Proportional allocation
-            if book_book_max + book_speech_max > 0:
-                book_book_target = int(target_sample_size * (book_book_max / (book_book_max + book_speech_max)))
+
+            # Proportional allocation (accounting for already-consumed)
+            bb_avail = book_book_max - len(seen_bb)
+            bs_avail = book_speech_max - len(seen_bs)
+            total_avail = bb_avail + bs_avail
+
+            if total_avail <= 0:
+                print(f"  ⚠ All pairs already consumed in previous rounds!")
+                return pd.DataFrame(columns=['id1', 'id2'])
+
+            target_sample_size = min(target_sample_size, total_avail)
+
+            if total_avail > 0:
+                book_book_target = int(target_sample_size * (bb_avail / total_avail))
                 book_speech_target = target_sample_size - book_book_target
             else:
                 book_book_target = book_speech_target = 0
-            
-            # Sample Book-Book pairs
+
+            # Clamp each target to its available count
+            book_book_target = min(book_book_target, bb_avail)
+            book_speech_target = min(book_speech_target, bs_avail)
+
+            # If one segment was clamped, give the surplus to the other
+            total_target = book_book_target + book_speech_target
+            if total_target < target_sample_size:
+                deficit = target_sample_size - total_target
+                if book_book_target < bb_avail:
+                    extra = min(deficit, bb_avail - book_book_target)
+                    book_book_target += extra
+                    deficit -= extra
+                if deficit > 0 and book_speech_target < bs_avail:
+                    book_speech_target += min(deficit, bs_avail - book_speech_target)
+
+            parts = []
+            new_bb_idx = np.array([], dtype=np.int64)
+            new_bs_idx = np.array([], dtype=np.int64)
+
+            # --- BB sampling ---
             if book_book_target > 0 and n_book >= 2:
-                attempts = 0
-                max_attempts = book_book_target * 5
-                while len([p for p in pairs_list if get_source_type(p['id1']) == 'B' and get_source_type(p['id2']) == 'B']) < book_book_target and attempts < max_attempts:
-                    i, j = np.random.choice(book_indices, size=2, replace=False)
-                    if i > j:
-                        i, j = j, i
-                    pair_key = (i, j)
-                    if pair_key not in seen_pairs:
-                        seen_pairs.add(pair_key)
-                        pairs_list.append({'id1': ids[i], 'id2': ids[j]})
-                    attempts += 1
-            
-            # Sample Book-Speech pairs
+                bb_target = min(book_book_target, bb_avail)
+                if bb_target >= bb_avail and len(seen_bb) > 0:
+                    # Take ALL remaining BB pairs
+                    all_bb = np.arange(book_book_max, dtype=np.int64)
+                    mask = np.ones(book_book_max, dtype=bool)
+                    mask[seen_bb[seen_bb < book_book_max]] = False
+                    lin_idx = all_bb[mask]
+                    del all_bb, mask
+                elif bb_target >= book_book_max:
+                    # No seen indices; take all
+                    lin_idx = np.arange(book_book_max, dtype=np.int64)
+                else:
+                    # Sample, excluding seen
+                    lin_idx = _sample_excluding(rng, book_book_max, seen_bb, bb_target)
+
+                ii, jj = _lin_to_bb(lin_idx)
+                new_bb_idx = lin_idx
+                parts.append(pd.DataFrame({'id1': book_id_arr[ii], 'id2': book_id_arr[jj]}))
+                del ii, jj, lin_idx
+                print(f"    BB: sampled {len(new_bb_idx):,} pairs "
+                      f"(seen {len(seen_bb):,}, avail {bb_avail:,})")
+
+            # --- BS sampling ---
             if book_speech_target > 0 and n_book > 0 and n_speech > 0:
-                attempts = 0
-                max_attempts = book_speech_target * 5
-                while len([p for p in pairs_list if (get_source_type(p['id1']) == 'B' and get_source_type(p['id2']) == 'S') or (get_source_type(p['id1']) == 'S' and get_source_type(p['id2']) == 'B')]) < book_speech_target and attempts < max_attempts:
-                    b_idx = np.random.choice(book_indices)
-                    s_idx = np.random.choice(speech_indices)
-                    pair_key = (min(b_idx, s_idx), max(b_idx, s_idx))
-                    if pair_key not in seen_pairs:
-                        seen_pairs.add(pair_key)
-                        pairs_list.append({'id1': ids[b_idx], 'id2': ids[s_idx]})
-                    attempts += 1
-            
-            print(f"  Generated {len(pairs_list):,} unique pairs")
-            return pd.DataFrame(pairs_list)
+                bs_target = min(book_speech_target, bs_avail)
+                if bs_target >= bs_avail and len(seen_bs) > 0:
+                    all_bs = np.arange(book_speech_max, dtype=np.int64)
+                    mask = np.ones(book_speech_max, dtype=bool)
+                    mask[seen_bs[seen_bs < book_speech_max]] = False
+                    lin_idx = all_bs[mask]
+                    del all_bs, mask
+                elif bs_target >= book_speech_max:
+                    lin_idx = np.arange(book_speech_max, dtype=np.int64)
+                else:
+                    lin_idx = _sample_excluding(rng, book_speech_max, seen_bs, bs_target)
+
+                b_idx = lin_idx // n_speech
+                s_idx = lin_idx % n_speech
+                new_bs_idx = lin_idx
+                parts.append(pd.DataFrame({'id1': book_id_arr[b_idx],
+                                           'id2': speech_id_arr[s_idx]}))
+                del lin_idx, b_idx, s_idx
+                print(f"    BS: sampled {len(new_bs_idx):,} pairs "
+                      f"(seen {len(seen_bs):,}, avail {bs_avail:,})")
+
+            # Persist newly consumed indices
+            if seen_indices_dir and group_label:
+                _save_seen(bb_path, np.union1d(seen_bb, new_bb_idx))
+                _save_seen(bs_path, np.union1d(seen_bs, new_bs_idx))
+
+            result = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=['id1', 'id2'])
+            print(f"  Generated {len(result):,} unique pairs")
+            return result
     
     # Allocate sampling budget proportionally
     n_p = len(df_p)
@@ -419,34 +606,22 @@ def generate_valid_pairs(
     target_pairs_sc = max_pairs - target_pairs_p
     
     print(f"\n=== Generating premise-premise pairs ===")
-    # Generate premise-premise pairs (sampled)
-    pairs_p = create_pairs_within_df(df_p, id_col, target_sample_size=target_pairs_p)
-    
+    pairs_p = create_pairs_within_df(df_p, id_col, target_sample_size=target_pairs_p,
+                                     group_label='premises')
+
     print(f"\n=== Generating conclusion-conclusion pairs ===")
-    # Generate conclusion-conclusion pairs (sampled)
-    pairs_sc = create_pairs_within_df(df_sc, id_col, target_sample_size=target_pairs_sc)
-    
-    # Combine both sets of pairs
+    pairs_sc = create_pairs_within_df(df_sc, id_col, target_sample_size=target_pairs_sc,
+                                      group_label='conclusions')
+
+    # Combine both sets of pairs (id1, id2 only — no text columns)
     all_pairs = pd.concat([pairs_p, pairs_sc], ignore_index=True)
-    
-    # Merge with original dataframes to get text content
-    print(f"\n=== Adding text content ===")
-    # Combine both dataframes for text lookup
-    df_all = pd.concat([df_p, df_sc]).drop_duplicates(subset=id_col)
-    
-    # Create a mapping from id to text
-    id_to_text = dict(zip(df_all[id_col], df_all[text_col]))
-    
-    # Add text columns
-    all_pairs['text1'] = all_pairs['id1'].map(id_to_text)
-    all_pairs['text2'] = all_pairs['id2'].map(id_to_text)
-    
+
     print(f"\n=== SUMMARY ===")
     print(f"Premise-premise pairs: {len(pairs_p):,}")
     print(f"Conclusion-conclusion pairs: {len(pairs_sc):,}")
     print(f"Total valid pairs: {len(all_pairs):,}")
     print(f"Columns: {list(all_pairs.columns)}")
-    
+
     # Filter out already-labeled pairs
     if exclude_labeled_csv:
         all_pairs = filter_already_labeled(all_pairs, labeled_csv=exclude_labeled_csv)
@@ -623,16 +798,19 @@ def setminus(
     """
     if id_cols is None:
         id_cols = ['id1', 'id2']
-    
-    # Create a set of tuples from df_small for efficient lookup
-    small_pairs = set(zip(df_small[id_cols[0]], df_small[id_cols[1]]))
-    
-    # Filter df_big to keep only rows whose pairs are not in df_small
-    mask = ~df_big.apply(lambda row: (row[id_cols[0]], row[id_cols[1]]) in small_pairs, axis=1)
-    result = df_big[mask].copy()
-    
+
+    c1, c2 = id_cols[0], id_cols[1]
+
+    # Merge-based anti-join (vectorised, scales to 20 M+ rows)
+    df_small_keys = df_small[[c1, c2]].drop_duplicates()
+    df_small_keys['__remove__'] = True
+
+    result = df_big.merge(df_small_keys, on=[c1, c2], how='left')
+    result = result[result['__remove__'].isna()].drop(columns='__remove__').copy()
+    result.reset_index(drop=True, inplace=True)
+
     print(f"Set difference: {len(df_big):,} - {len(df_small):,} = {len(result):,} rows")
-    
+
     return result
 
 
@@ -686,55 +864,6 @@ def merge_pairwise_texts(
     - If an id in df2 does not exist in df1, the corresponding text will be NaN.
     - Pairs violating comparison rules are filtered out.
     """
-    def parse_id(text_id: str) -> tuple:
-        """
-        Parse ID to extract source type (B/S) and clause type (p/sc).
-        
-        Returns
-        -------
-        tuple : (source_type, clause_type) or (None, None) if invalid
-        """
-        if not isinstance(text_id, str) or len(text_id) < 3:
-            return None, None
-        
-        # First character should be B or S
-        source_type = text_id[0].upper()
-        if source_type not in ['B', 'S']:
-            return None, None
-        
-        # Last characters should be 'p' or 'sc'
-        if text_id.endswith('sc'):
-            clause_type = 'sc'
-        elif text_id.endswith('p'):
-            clause_type = 'p'
-        else:
-            return None, None
-        
-        return source_type, clause_type
-    
-    def is_valid_pair(id1: str, id2: str) -> bool:
-        """
-        Check if pair meets comparison rules:
-        - No Speech-Speech comparisons
-        - No Premise-Conclusion cross-comparisons
-        """
-        source1, clause1 = parse_id(id1)
-        source2, clause2 = parse_id(id2)
-        
-        # Invalid format
-        if source1 is None or source2 is None:
-            return False
-        
-        # Rule 2: Never Speech-Speech
-        if source1 == 'S' and source2 == 'S':
-            return False
-        
-        # Rule 3: Never Premise-Conclusion mix
-        if clause1 != clause2:
-            return False
-        
-        return True
-    
     # Unpack df1 columns
     if len(df1_cols) != 2:
         raise ValueError("df1_cols must have length 2: [id_col, text_col].")
@@ -761,14 +890,26 @@ def merge_pairwise_texts(
         columns={id1_col_df2: "id1", id2_col_df2: "id2"}
     )
     
-    # Filter pairs based on comparison rules
+    # Filter pairs based on comparison rules (vectorised for millions of rows)
     if len(df2_reduced) == 0:
         print(f"Warning: df2 is empty (0 pairs). Returning empty result.")
         return pd.DataFrame(columns=["id1", "id2", "text1", "text2", "verdict"])
 
-    valid_mask = df2_reduced.apply(lambda row: is_valid_pair(row['id1'], row['id2']), axis=1)
+    id1_str = df2_reduced['id1'].astype(str)
+    id2_str = df2_reduced['id2'].astype(str)
+    src1 = id1_str.str[0].str.upper()
+    src2 = id2_str.str[0].str.upper()
+    suf1 = np.where(id1_str.str.endswith('sc'), 'sc',
+                    np.where(id1_str.str.endswith('p'), 'p', ''))
+    suf2 = np.where(id2_str.str.endswith('sc'), 'sc',
+                    np.where(id2_str.str.endswith('p'), 'p', ''))
+    valid_mask = (
+        (suf1 != '') & (suf2 != '') &        # valid format
+        ~((src1 == 'S') & (src2 == 'S')) &    # no Speech-Speech
+        (suf1 == suf2)                        # same clause type
+    )
     df2_filtered = df2_reduced[valid_mask].copy()
-    
+
     if len(df2_filtered) == 0:
         print(f"Warning: All {len(df2_reduced)} pairs were filtered out by comparison rules.")
         return pd.DataFrame(columns=["id1", "id2", "text1", "text2", "verdict"])
@@ -2505,7 +2646,10 @@ def generate_final_df(
     df: pd.DataFrame, 
     prob_col: str, 
     threshold: float,
-    keep_cols: List[str] = ['id1', 'id2', 'text1', 'text2', 'entailment_probability']
+    keep_cols: List[str] = ['id1', 'id2', 'text1', 'text2', 'entailment_probability'],
+    df_clause: Optional[pd.DataFrame] = None,
+    id_col: str = 'sentence_id',
+    text_col: str = 'sentence',
 ):
     """
     Filters the dataframe to return only the pairs that need to be sent to the LLM.
@@ -2536,11 +2680,20 @@ def generate_final_df(
     df_temp = df.copy()
     if prob_col != 'entailment_probability' and 'entailment_probability' in keep_cols:
         df_temp = df_temp.rename(columns={prob_col: 'entailment_probability'})
-    
+
+    # Lazy text lookup: add text1/text2 from df_clause if missing
+    if df_clause is not None:
+        _id_to_text = dict(zip(df_clause[id_col].astype(str), df_clause[text_col]))
+        if 'text1' not in df_temp.columns and 'text1' in keep_cols:
+            df_temp['text1'] = df_temp['id1'].astype(str).map(_id_to_text)
+        if 'text2' not in df_temp.columns and 'text2' in keep_cols:
+            df_temp['text2'] = df_temp['id2'].astype(str).map(_id_to_text)
+
     # Ensure columns exist before selecting
     missing = [c for c in keep_cols if c not in df_temp.columns]
     if missing:
-        raise ValueError(f"Missing required columns for final output: {missing}")
+        raise ValueError(f"Missing required columns for final output: {missing}. "
+                         f"Pass df_clause= to auto-add text columns.")
         
     df_out = df_temp.loc[mask, keep_cols].copy()
     
@@ -2811,14 +2964,15 @@ def process_one_way_results(
 
     1. **Resolved pairs** – pairs where both (A,B) and (B,A) appear in
        the df, so we can immediately determine the bidirectional verdict:
-       - Both YES  → add to results with verdict YES
-       - At least one NO → add to results with verdict NO
+       - Both YES  → add to results with verdict YES  (both rows kept)
+       - At least one NO → add to results with verdict NO (both rows kept)
     2. **Needs-reverse pairs** – pairs (A,B) that got YES but whose
        reverse (B,A) is **not** in the current df.  These must be sent
        back to the LLM for the second direction.
 
-    Pairs that got NO in the forward direction are automatically resolved
-    as NO (no need to check the reverse).
+    **NO-verdict shortcut**: If A→B = NO the pair verdict is NO regardless
+    of B→A.  We therefore immediately record *both* (A,B) and (B,A) with
+    ``verdict='NO'`` so neither direction is ever sent to the LLM again.
 
     Parameters
     ----------
@@ -2838,6 +2992,8 @@ def process_one_way_results(
 
         - ``df_resolved``: pairs whose bidirectional verdict is known.
           Has all original columns plus a ``verdict`` column.
+          Each undirected pair may produce **two** rows (A,B) and (B,A)
+          so that both directions are recorded.
         - ``df_needs_reverse``: pairs that need to be sent to the LLM
           in the reverse direction.  Contains the original row columns
           plus ``reverse_id1`` and ``reverse_id2`` indicating which
@@ -2858,6 +3014,26 @@ def process_one_way_results(
     # processing (A,B) and (B,A) separately when both appear in df.
     resolved_sorted_keys = set()
 
+    def _make_reverse_row(orig_row, verdict_val):
+        """Create a synthetic reverse-direction row (B,A) from an (A,B) row."""
+        rev = orig_row.copy()
+        rev[id1_col] = str(orig_row[id2_col])
+        rev[id2_col] = str(orig_row[id1_col])
+        # Swap text columns if present
+        for t1, t2 in [('sentence_text_1', 'sentence_text_2'),
+                        ('text1', 'text2')]:
+            if t1 in rev.index and t2 in rev.index:
+                rev[t1], rev[t2] = orig_row[t2], orig_row[t1]
+        # Swap argument IDs if present
+        if 'argument_id_1' in rev.index and 'argument_id_2' in rev.index:
+            rev['argument_id_1'], rev['argument_id_2'] = (
+                orig_row['argument_id_2'], orig_row['argument_id_1'])
+        rev['verdict'] = verdict_val
+        # Mark the reverse conclusion as inferred (not from LLM)
+        if conclusion_col in rev.index:
+            rev[conclusion_col] = 'NO (inferred)'
+        return rev
+
     for idx, row in df.iterrows():
         a = str(row[id1_col])
         b = str(row[id2_col])
@@ -2872,20 +3048,36 @@ def process_one_way_results(
 
         if fwd_conclusion != positive_label.upper():
             # Forward is NO → pair is NO regardless of reverse
+            # Record (A,B) = NO
             resolved_row = row.copy()
             resolved_row['verdict'] = 'NO'
             resolved_rows.append(resolved_row)
+            # NO-verdict shortcut: also record (B,A) = NO
+            resolved_rows.append(_make_reverse_row(row, 'NO'))
             resolved_sorted_keys.add(sorted_key)
         elif rev_conclusion is not None:
             # Both directions exist in df
             if rev_conclusion == positive_label.upper():
-                resolved_row = row.copy()
-                resolved_row['verdict'] = 'YES'
-                resolved_rows.append(resolved_row)
+                # Both YES → verdict YES (record both directions)
+                fwd_row = row.copy()
+                fwd_row['verdict'] = 'YES'
+                resolved_rows.append(fwd_row)
+                # Find the actual reverse row in df for the (B,A) entry
+                rev_mask = (df[id1_col].astype(str) == b) & (df[id2_col].astype(str) == a)
+                if rev_mask.any():
+                    rev_row = df.loc[rev_mask.idxmax()].copy()
+                    rev_row['verdict'] = 'YES'
+                    resolved_rows.append(rev_row)
             else:
-                resolved_row = row.copy()
-                resolved_row['verdict'] = 'NO'
-                resolved_rows.append(resolved_row)
+                # One is NO → verdict NO (record both directions)
+                fwd_row = row.copy()
+                fwd_row['verdict'] = 'NO'
+                resolved_rows.append(fwd_row)
+                rev_mask = (df[id1_col].astype(str) == b) & (df[id2_col].astype(str) == a)
+                if rev_mask.any():
+                    rev_row = df.loc[rev_mask.idxmax()].copy()
+                    rev_row['verdict'] = 'NO'
+                    resolved_rows.append(rev_row)
             resolved_sorted_keys.add(sorted_key)
         else:
             # Forward is YES but reverse doesn't exist → need to query LLM
@@ -2900,12 +3092,16 @@ def process_one_way_results(
 
     n_yes = (df_resolved['verdict'] == 'YES').sum() if len(df_resolved) > 0 else 0
     n_no = (df_resolved['verdict'] == 'NO').sum() if len(df_resolved) > 0 else 0
+    n_inferred = 0
+    if len(df_resolved) > 0 and conclusion_col in df_resolved.columns:
+        n_inferred = (df_resolved[conclusion_col].astype(str).str.contains('inferred', case=False)).sum()
 
     print(f"\n{'='*60}")
     print(f"ONE-WAY RESULTS PROCESSING")
     print(f"{'='*60}")
     print(f"Total input pairs: {len(df)}")
-    print(f"Resolved immediately: {len(df_resolved)} (YES={n_yes}, NO={n_no})")
+    print(f"Resolved rows: {len(df_resolved)} (YES={n_yes}, NO={n_no})")
+    print(f"  ↳ Inferred reverse NO (money saved): {n_inferred}")
     print(f"Need reverse LLM call: {len(df_needs_reverse)}")
     print(f"{'='*60}\n")
 
@@ -3036,6 +3232,7 @@ def send_back_to_llm(
     append_to_llm_labeled_pairs(df_reverse_results)
 
     # Now resolve: the forward was YES. If reverse is YES → verdict YES, else NO.
+    # Produce BOTH directional rows (A,B) and (B,A) for each pair.
     resolved_rows = []
     reverse_lookup = {}
     for _, row in df_reverse_results.iterrows():
@@ -3043,17 +3240,54 @@ def send_back_to_llm(
         conclusion = str(row.get('llm_conclusion_12', '')).strip().upper()
         reverse_lookup[key] = conclusion
 
+    id1_col = 'sentence_id_1'
+    id2_col = 'sentence_id_2'
+
     for _, orig_row in df_needs_reverse.iterrows():
         rev_id1 = str(orig_row['reverse_id1'])
         rev_id2 = str(orig_row['reverse_id2'])
         rev_conclusion = reverse_lookup.get((rev_id1, rev_id2), 'NO')
 
-        result_row = orig_row.drop(labels=['reverse_id1', 'reverse_id2'], errors='ignore').copy()
-        if rev_conclusion == positive_label.upper():
-            result_row['verdict'] = 'YES'
+        verdict = 'YES' if rev_conclusion == positive_label.upper() else 'NO'
+
+        # Forward row (A,B)
+        fwd_row = orig_row.drop(labels=['reverse_id1', 'reverse_id2'], errors='ignore').copy()
+        fwd_row['verdict'] = verdict
+        resolved_rows.append(fwd_row)
+
+        # Reverse row (B,A) — use the actual LLM result row if available,
+        # otherwise construct from forward row.
+        rev_key = (rev_id1, rev_id2)
+        if rev_key in reverse_lookup:
+            # Find matching row in df_reverse_results
+            rev_mask = (
+                (df_reverse_results['sentence_id_1'].astype(str) == rev_id1) &
+                (df_reverse_results['sentence_id_2'].astype(str) == rev_id2)
+            )
+            if rev_mask.any():
+                rev_row = df_reverse_results.loc[rev_mask.idxmax()].copy()
+                rev_row['verdict'] = verdict
+                resolved_rows.append(rev_row)
+            else:
+                # Fallback: construct synthetic reverse row
+                rev_row = fwd_row.copy()
+                rev_row[id1_col] = rev_id1
+                rev_row[id2_col] = rev_id2
+                for t1, t2 in [('sentence_text_1', 'sentence_text_2')]:
+                    if t1 in rev_row.index and t2 in rev_row.index:
+                        rev_row[t1], rev_row[t2] = fwd_row.get(t2, ''), fwd_row.get(t1, '')
+                if 'argument_id_1' in rev_row.index and 'argument_id_2' in rev_row.index:
+                    rev_row['argument_id_1'], rev_row['argument_id_2'] = (
+                        fwd_row.get('argument_id_2', ''), fwd_row.get('argument_id_1', ''))
+                rev_row['verdict'] = verdict
+                resolved_rows.append(rev_row)
         else:
-            result_row['verdict'] = 'NO'
-        resolved_rows.append(result_row)
+            # No LLM result for reverse → construct synthetic row
+            rev_row = fwd_row.copy()
+            rev_row[id1_col] = rev_id1
+            rev_row[id2_col] = rev_id2
+            rev_row['verdict'] = verdict
+            resolved_rows.append(rev_row)
 
     df_final_resolved = pd.DataFrame(resolved_rows)
 
@@ -3123,7 +3357,19 @@ def process_llm_results_bidirectional(
     append_to_llm_labeled_pairs(df_one_way, labeled_csv=labeled_csv)
 
     # Step 2: Separate resolved vs needs-reverse
+    # (process_one_way_results now produces BOTH directional rows for
+    #  NO-verdict pairs — e.g. if AB=NO, both (A,B) and (B,A) are
+    #  added to df_resolved with verdict=NO)
     df_resolved, df_needs_reverse = process_one_way_results(df_one_way)
+
+    # Step 2.1: Record the inferred reverse-NO pairs in llm_labeled_pairs
+    # so they are never sent to the LLM in future iterations.
+    if len(df_resolved) > 0 and 'llm_conclusion_12' in df_resolved.columns:
+        inferred_mask = df_resolved['llm_conclusion_12'].astype(str).str.contains('inferred', case=False, na=False)
+        if inferred_mask.any():
+            df_inferred = df_resolved[inferred_mask]
+            append_to_llm_labeled_pairs(df_inferred, labeled_csv=labeled_csv)
+            print(f"✓ Recorded {len(df_inferred)} inferred reverse-NO pairs in {labeled_csv}")
 
     # Step 2.5: Filter out reverse pairs that were already sent to LLM
     # IMPORTANT: Use DIRECTIONAL check — (B,A) is only "already labeled" if
@@ -3132,18 +3378,21 @@ def process_llm_results_bidirectional(
         before = len(df_needs_reverse)
         if os.path.exists(labeled_csv):
             df_labeled_master = pd.read_csv(labeled_csv)
-            # Build set of directional (id1, id2) pairs already sent
-            labeled_directional = set(
-                zip(df_labeled_master['sentence_id_1'].astype(str),
-                    df_labeled_master['sentence_id_2'].astype(str))
-            )
-            # Only remove reverse pairs where (B,A) was ALREADY sent as (B,A)
-            df_needs_reverse = df_needs_reverse[
-                ~df_needs_reverse.apply(
-                    lambda r: (str(r['reverse_id1']), str(r['reverse_id2'])) in labeled_directional,
-                    axis=1
-                )
-            ].copy()
+            # Vectorised directional anti-join
+            df_rev_keys = df_needs_reverse[['reverse_id1', 'reverse_id2']].copy()
+            df_rev_keys.columns = ['sentence_id_1', 'sentence_id_2']
+            df_rev_keys['sentence_id_1'] = df_rev_keys['sentence_id_1'].astype(str)
+            df_rev_keys['sentence_id_2'] = df_rev_keys['sentence_id_2'].astype(str)
+
+            df_lab_keys = df_labeled_master[['sentence_id_1', 'sentence_id_2']].drop_duplicates()
+            df_lab_keys['sentence_id_1'] = df_lab_keys['sentence_id_1'].astype(str)
+            df_lab_keys['sentence_id_2'] = df_lab_keys['sentence_id_2'].astype(str)
+            df_lab_keys['__sent__'] = True
+
+            check = df_rev_keys.merge(df_lab_keys, on=['sentence_id_1', 'sentence_id_2'], how='left')
+            already_sent_mask = check['__sent__'].notna().values
+            df_needs_reverse = df_needs_reverse[~already_sent_mask].copy()
+
             removed = before - len(df_needs_reverse)
             if removed > 0:
                 print(f"✓ Filtered {removed} reverse pairs already sent (directional check)")
@@ -3220,18 +3469,27 @@ def filter_already_labeled(
 
     df_labeled = pd.read_csv(labeled_csv)
 
-    # Build a set of sorted pair keys from the labeled file
-    labeled_keys = set()
-    for _, row in df_labeled.iterrows():
-        key = tuple(sorted([str(row['sentence_id_1']), str(row['sentence_id_2'])]))
-        labeled_keys.add(key)
+    # Build sorted-key columns for both dataframes (checks both directions)
+    lab_a = df_labeled['sentence_id_1'].astype(str)
+    lab_b = df_labeled['sentence_id_2'].astype(str)
+    df_labeled_keys = pd.DataFrame({
+        '_k1': np.where(lab_a <= lab_b, lab_a, lab_b),
+        '_k2': np.where(lab_a <= lab_b, lab_b, lab_a),
+    }).drop_duplicates()
+    df_labeled_keys['__labeled__'] = True
 
-    # Filter out pairs that are already labeled
-    mask = df_pairs.apply(
-        lambda row: tuple(sorted([str(row[id1_col]), str(row[id2_col])])) not in labeled_keys,
-        axis=1,
-    )
-    df_filtered = df_pairs[mask].copy()
+    pair_a = df_pairs[id1_col].astype(str)
+    pair_b = df_pairs[id2_col].astype(str)
+    df_pairs = df_pairs.copy()
+    df_pairs['_k1'] = np.where(pair_a <= pair_b, pair_a, pair_b)
+    df_pairs['_k2'] = np.where(pair_a <= pair_b, pair_b, pair_a)
+
+    merged = df_pairs.merge(df_labeled_keys, on=['_k1', '_k2'], how='left')
+    df_filtered = merged[merged['__labeled__'].isna()].drop(columns=['_k1', '_k2', '__labeled__']).copy()
+    df_filtered.reset_index(drop=True, inplace=True)
+
+    # Also drop temp columns from the original if it was modified
+    df_pairs.drop(columns=['_k1', '_k2'], inplace=True, errors='ignore')
 
     removed = len(df_pairs) - len(df_filtered)
     print(f"Filtered out {removed:,} already-labeled pairs (kept {len(df_filtered):,} of {len(df_pairs):,})")
@@ -3432,7 +3690,12 @@ def extract_argument_id(sentence_id: str) -> Optional[str]:
     return None
 
 
-def format_df_to_llm(df_to_llm: pd.DataFrame) -> pd.DataFrame:
+def format_df_to_llm(
+    df_to_llm: pd.DataFrame,
+    df_clause: Optional[pd.DataFrame] = None,
+    id_col: str = 'sentence_id',
+    text_col: str = 'sentence',
+) -> pd.DataFrame:
     """
     Format a DataFrame of FEA-selected pairs for LLM evaluation.
 
@@ -3445,7 +3708,14 @@ def format_df_to_llm(df_to_llm: pd.DataFrame) -> pd.DataFrame:
     Parameters
     ----------
     df_to_llm : pd.DataFrame
-        Must contain ``id1, id2, text1, text2, entailment_probability``.
+        Must contain ``id1, id2, entailment_probability``.
+        ``text1, text2`` are added automatically from ``df_clause``
+        if not already present.
+    df_clause : pd.DataFrame, optional
+        Clause-level DataFrame used to look up text when text columns
+        are missing from ``df_to_llm``.
+    id_col, text_col : str
+        Column names in ``df_clause``.
 
     Returns
     -------
@@ -3454,6 +3724,16 @@ def format_df_to_llm(df_to_llm: pd.DataFrame) -> pd.DataFrame:
         ``[sentence_id_2, sentence_id_1, sentence_text_2, argument_id_2,
         sentence_text_1, argument_id_1, score]``
     """
+    # Lazy text lookup
+    if df_clause is not None:
+        _lut = dict(zip(df_clause[id_col].astype(str), df_clause[text_col]))
+        if 'text1' not in df_to_llm.columns:
+            df_to_llm = df_to_llm.copy()
+            df_to_llm['text1'] = df_to_llm['id1'].astype(str).map(_lut)
+        if 'text2' not in df_to_llm.columns:
+            df_to_llm = df_to_llm.copy()
+            df_to_llm['text2'] = df_to_llm['id2'].astype(str).map(_lut)
+
     df = df_to_llm[['id1', 'id2', 'text1', 'text2', 'entailment_probability']].copy()
 
     df = df.rename(columns={
@@ -3538,14 +3818,20 @@ def finalize_pipeline_iteration(
         if matched < len(df_to_llm_with_results):
             print(f"⚠ Warning: {len(df_to_llm_with_results) - matched} pairs have no mock LLM data")
 
-        sent_pairs = set(zip(df_to_llm['sentence_id_1'], df_to_llm['sentence_id_2']))
-        mask = remaining_llm_calls.apply(
-            lambda row: (row['sentence_id_1'], row['sentence_id_2']) not in sent_pairs,
-            axis=1,
+        # Vectorised anti-join for test mode
+        df_sent_keys = df_to_llm[['sentence_id_1', 'sentence_id_2']].drop_duplicates()
+        df_sent_keys['__sent__'] = True
+        before_n = len(remaining_llm_calls)
+        remaining_llm_calls = remaining_llm_calls.merge(
+            df_sent_keys, on=['sentence_id_1', 'sentence_id_2'], how='left'
         )
-        remaining_llm_calls = remaining_llm_calls[mask].copy()
+        remaining_llm_calls = remaining_llm_calls[
+            remaining_llm_calls['__sent__'].isna()
+        ].drop(columns='__sent__').copy()
+        remaining_llm_calls.reset_index(drop=True, inplace=True)
+        removed = before_n - len(remaining_llm_calls)
 
-        print(f"✓ Removed {len(sent_pairs)} pairs from remaining LLM calls")
+        print(f"✓ Removed {removed} pairs from remaining LLM calls")
         print(f"✓ Remaining pairs for future iterations: {len(remaining_llm_calls)}")
 
         if remaining_llm_calls_path:
@@ -3561,14 +3847,18 @@ def finalize_pipeline_iteration(
         # Track in llm_labeled_pairs
         append_to_llm_labeled_pairs(df_to_llm)
 
-        sent_pairs = set(zip(df_to_llm['sentence_id_1'], df_to_llm['sentence_id_2']))
-        mask = unlabeled_pairs.apply(
-            lambda row: (row['id1'], row['id2']) not in sent_pairs,
-            axis=1,
-        )
-        unlabeled_pairs = unlabeled_pairs[mask].copy()
+        # Vectorised anti-join (scales to tens of millions of rows)
+        df_sent_keys = df_to_llm[['sentence_id_1', 'sentence_id_2']].rename(
+            columns={'sentence_id_1': 'id1', 'sentence_id_2': 'id2'}
+        ).drop_duplicates()
+        df_sent_keys['__sent__'] = True
+        before_n = len(unlabeled_pairs)
+        unlabeled_pairs = unlabeled_pairs.merge(df_sent_keys, on=['id1', 'id2'], how='left')
+        unlabeled_pairs = unlabeled_pairs[unlabeled_pairs['__sent__'].isna()].drop(columns='__sent__').copy()
+        unlabeled_pairs.reset_index(drop=True, inplace=True)
+        removed = before_n - len(unlabeled_pairs)
 
-        print(f"✓ Removed {len(sent_pairs)} pairs from unlabeled_pairs")
+        print(f"✓ Removed {removed} pairs from unlabeled_pairs")
         print(f"✓ Remaining pairs for future iterations: {len(unlabeled_pairs)}")
 
         if unlabeled_pairs_path:
