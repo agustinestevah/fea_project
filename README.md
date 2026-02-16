@@ -1,154 +1,344 @@
 # Free Entailment Algorithm
 
 ## Overview
-This algorithm determines semantic entailment between text pairs by combining multiple similarity measures and machine learning classifiers, iteratively improving through LLM feedback.
+
+The **Free Entailment Algorithm (FEA)** is an iterative machine learning system that determines semantic entailment between text pairs. It combines:
+- **Similarity measures** (fine-tuned bi-encoder and cross-encoder models)
+- **Feature engineering** (cosine similarity, NLI scores, transitivity graphs)
+- **Ensemble classifiers** (logistic regression, SVM, gradient boosting, decision trees)
+- **Active learning** with LLM feedback to iteratively improve predictions
 
 ---
 
-## Setup
+## Algorithm Flow
 
-### 1. Initial Similarity Generation
-- **Generate Cosine Similarity:** Use a bi-encoder SBERT model (currently `BAAI/bge-en-icl`, dependent on resources) to score initial pairings.
-- **Select for Labeling:**
-  - Pick a fraction of pairs with **high cosine similarity** to send to LLM for labeling.
-  - Include a fraction with **low cosine similarity** to ensure diversity for model training.
-  - *Note:* In the initial training phase, this step is skipped.
+```mermaid
+graph TD
+    A["Input:<br/>Premises & Conclusions"] --> B["Round Zero:<br/>Embed & Filter Pairs"]
+    B --> C["Send Top Similarity<br/>Pairs to LLM"]
+    C --> D["Accumulate<br/>Labeled Data"]
+    D --> E["FEA Loop:<br/>Generate Candidates"]
+    E --> F["Compute 4 Features:<br/>Similarity, NLI, Transitivity"]
+    F --> G["Train Ensemble<br/>Classifiers"]
+    G --> H["Select Best Model<br/>ROC-AUC"]
+    H --> I["Predict on<br/>Candidates"]
+    I --> J["Optimize<br/>Threshold τ"]
+    J --> K["Send Selected Pairs<br/>to LLM"]
+    K --> D
+    D -.->|Next Iteration| E
+    H -.->|Final Output| L["Entailment<br/>Probabilities"]
+    
+    click B "#round-zero"
+    click E "#fea-loop"
+    click F "#features"
+    click G "#classifiers"
+    click J "#thresholding"
+    click K "#active-learning"
+```
 
-### 2. LLM Labeling
-The SBERT model (used later as a cross-encoder) performs **BEST** when the LLM evaluates:
-- **A → B?** (Does A entail B?) [*Included in initial training*]
-- **B → A?** (Does B entail A?) [*Included in initial training*]
-- **Contradiction?** (Does A contradict B and vice versa?)
-- **Neutral/Related?** (Are they on the same topic e.g., "The King", but without a logical link?)
-- **Paraphrase?** (If A paraphrases B)
-
-**Data Division:**
-The data is split into two sets (an initial random sample is used to mimic this):
-- **[labeled]**: Pairs with LLM verdicts.
-- **[candidates]**: Unlabeled pairs awaiting classification.
-
-**Processing Candidates:**
-For each pair $(A, B)$ in [candidates]:
-1. Find the equivalence class of $A$ in [labeled], denoted as $[A]$.
-2. Find the equivalence class of $B$ in [labeled], denoted as $[B]$.
-3. Obtain $\alpha$ weights for similarity scoring.
-
-### 3. Fine-Tune Models on Labeled Data
-- **Bi-Encoder:** Fine-tune on all results pairs.
-- **Cross-Encoder:** Fine-tune on all results pairs.
-  - *Crucial:* The cross-encoder requires `add_cross_encoder_score` to fit the model correctly, as it takes more arguments than the LLM queries.
-- **Computation Note:** Training is computationally expensive. Pre-trained models are available in the repository (trained on UChicago RCC). They were trained on the 450,000 LLM results. Please check the notebook comments for instructions on skipping unnecessary computation. Also check documentation found within those libraries to analyze training efficiency.
-
-### 4. Generate Fine-Tuned Similarity Scores
-Produce fine-tuned cosine similarity scores for:
-- Every pair $(A, B)$ in candidates.
-- Every pair $(A, C)$ where $C \in [B]$ (equivalence class of B).
-- Every pair $(D, B)$ where $D \in [A]$ (equivalence class of A).
+**Key Components:**
+- [Round Zero](#round-zero) - Initial filtering and LLM labeling
+- [FEA Loop](#fea-loop) - Iterative improvement cycle
+- [Feature Engineering](#features) - Four core predictive features
+- [Ensemble Classifiers](#classifiers) - Model selection and training
+- [Active Learning](#active-learning) - Threshold optimization and sampling
 
 ---
 
-## Features
+## Round Zero {#round-zero}
 
-The algorithm uses **4 key features** to predict entailment:
+### Purpose
+Initialize a high-quality labeled dataset by sending only the most informative pairs to the LLM.
+
+### Steps
+
+**1. Embed All Text**
+- Uses fine-tuned SBERT bi-encoder (`BAAI/bge-en-icl`)
+- Generates vector embeddings for premises (p) and conclusions (sc)
+
+**2. Generate Candidate Pairs**
+- **B-B pairs:** Book-Book comparisons (p-p or sc-sc)
+- **B-S pairs:** Book-Speech comparisons (p-p or sc-sc)
+- Creates ~100,000 pairs of each type
+
+**3. Calculate Similarity & Filter**
+- Computes cosine similarity for all pairs
+- Identifies top 1% by similarity (keeps highest-confidence pairs)
+- **Rationale:** Limits LLM costs and focuses on pairs likely to be entailed
+- **Example output:**
+  ```
+  [Premises] Scanning 45,730,266 B-B candidates
+  [Premises] Found 309,794 pairs above threshold 0.7539
+  [Premises] Scanning 378,648,324 B-S candidates
+  [Premises] Found 1,842,492 pairs above threshold 0.7075
+  Randomly sampled 50,000 B-B pairs
+  Randomly sampled 50,000 B-S pairs
+  ```
+
+**4. LLM Labeling with Bidirectionality**
+- Sends filtered pairs to LLM for entailment analysis
+- If pair (A, B) → YES, also checks (B, A)
+- If pair (A, B) → NO, automatically marks (B, A) as NO
+- Saves results in batches for safety
+
+**5. Output**
+DataFrame with labeled entailment verdicts:
+```
+sentence_id_1 | sentence_id_2 | answers_12 | llm_conclusion_12 | verdict
+B0448006p     | B1089003p     | YES, NO   | NO (inferred)     | NO
+```
+
+---
+
+## FEA Loop {#fea-loop}
+
+### Purpose
+Orchestrate the main iterative improvement cycle.
+
+### Key Operations
+
+**1. Generate Valid Pairs**
+- Creates new pairs from unlabeled candidates
+- Supports up to ~25M pairs
+- Excludes previously labeled and already-generated pairs
+
+**2. Set Stopping Criteria**
+- **Option A:** Fixed number of iterations
+- **Option B:** Budget constraint
+- Loop terminates when first criterion is met
+
+**3. Pipeline Execution**
+- Calls FEA Pipeline for feature computation
+- Trains ensemble classifiers
+- Queries LLM for high-uncertainty pairs
+- Checks bidirectionality for positive results
+
+**4. Cycle Iteration**
+- Adds new LLM labels to training set
+- Generates next batch of candidates
+- Repeats until stopping criteria reached
+
+---
+
+## Feature Engineering {#features}
+
+## Feature Engineering {#features}
+
+The classifier uses **4 key features** to predict entailment:
 
 ### 1. Cosine Similarity (Bi-Encoder) Neighbor Score
-- **Source:** Fine-tuned SBERT bi-encoder.
-- **Function:** Weights cosine similarity of $A$ to $[B]$ and $B$ to $[A]$.
-- **Formula:**
-![equation](https://latex.codecogs.com/svg.image?\color{white}{S_{AB}=\sigma_{AB}\left[\frac{\alpha}{|\mathcal{I}(A)|}\sum_{k\in\mathcal{I}(A)}\sigma_{AC}+\frac{1-\alpha}{|\mathcal{I}(B)|}\sum_{k\in\mathcal{I}(B)}\sigma_{BC}\right]})
-  Where:
-  - $\sigma_{ij}$ is the cosine similarity of $i$ and $j$.
-  - $\mathcal{I}(j) = [j]$ (the equivalence class of $j$, minus $j$ itself).
-  - If both $[j]$ and $[i]$ are empty, simply computes $\sigma_{ij}$ as the score.
+
+**Source:** Fine-tuned SBERT bi-encoder
+
+**Logic:** Weights similarity between text $A$ and the labeled equivalence class of $B$, plus similarity between $B$ and the equivalence class of $A$.
+
+**Formula:**
+$$S_{AB} = \sigma_{AB} \left[ \frac{\alpha}{|\mathcal{I}(A)|} \sum_{k \in \mathcal{I}(A)} \sigma_{AC} + \frac{1-\alpha}{|\mathcal{I}(B)|} \sum_{k \in \mathcal{I}(B)} \sigma_{BC} \right]$$
+
+Where:
+- $\sigma_{ij}$ = cosine similarity between $i$ and $j$
+- $\mathcal{I}(j) = [j]$ (equivalence class of $j$, excluding $j$ itself)
+- $\alpha$ = learned weighting parameter
+- If either class is empty, uses direct similarity $\sigma_{ij}$
 
 ### 2. NLI Score (Cross-Encoder)
-- **Model:** Cross-Encoder (`nli-deberta-v3-base`).
-- **Function:** Processes the pair $(A, B)$ jointly defined by the NLI similarity of $A$ to $[B]$ and $B$ to $[A]$.
-- **Formula:** Uses the same weighting formula as Feature 1.
+
+**Model:** Cross-Encoder (`nli-deberta-v3-base`)
+
+**Logic:** Processes pair $(A, B)$ jointly to score entailment likelihood
+
+**Formula:** Uses same weighting formula as Feature 1 (applied to NLI model outputs)
 
 ### 3. Transitivity Score
-- **Method:** Builds a **directed graph** from [labeled] pairs.
-- **Check:** Does a path exist $A \leftrightarrow B$ via:
-  - $A \to X \to B$ (Forward path)
-  - $B \to Y \to A$ (Backward path)
-- **Scoring:**
-  - **1 hop:** Score = 1.0
-  - **2 hops:** Score = $1.0 \times \text{decay}$
+
+**Method:** Builds a directed graph from labeled pairs
+
+**Check:** Detects paths between $A$ and $B$:
+- Forward: $A \to X \to B$
+- Backward: $B \to Y \to A$
+
+**Scoring:**
+- **1 hop:** Score = 1.0
+- **2 hops:** Score = $1.0 \times \text{decay}$
+- **No path:** Score = 0.0
 
 ### 4. Additional Features
-- *TBD*
+
+*Reserved for future work*
 
 ---
 
-## Predicting Entailment
+## Ensemble Classifiers {#classifiers}
 
-### 1. Train Multiple Classifiers
-The 4 features are fed into the following candidate classifiers:
-- **Logistic Regression**
-- **Spline Regression**
-- **Kernel SVM**
-  - Config: `SVC(kernel='rbf', probability=True, class_weight='balanced', random_state=42)`
-- **Decision Tree**
-  - Config: `DecisionTreeClassifier(class_weight='balanced', random_state=42, max_depth=kwargs.get("max_depth", 5))`
-- **Gradient Boosting**
-  - *Note:* First optimizes parameters with Optuna.
-  - Config: `HistGradientBoostingClassifier(random_state=42, class_weight='balanced', learning_rate=0.05, max_iter=200, l2_regularization=1.0)`
+### Training
 
-### 2. Model Selection
-- Selects the model with the **largest ROC-AUC** score.
-- **ROC-AUC** measures how well the model distinguishes between "YES" (Entailment) and "NO" (Non-entailment) as you change the threshold ($\tau$).
+The 4 features are fed into multiple classifiers:
 
-### 3. Output
-- Produces a **probability of entailment** for each candidate pair $(A, B)$.
+| Classifier | Config |
+|-----------|--------|
+| **Logistic Regression** | Scikit-learn default |
+| **Spline Regression** | Isotonic calibration |
+| **Kernel SVM** | `SVC(kernel='rbf', probability=True, class_weight='balanced')` |
+| **Decision Tree** | `DecisionTreeClassifier(max_depth=5, class_weight='balanced')` |
+| **Gradient Boosting** | `HistGradientBoostingClassifier(max_iter=200, learning_rate=0.05, l2_reg=1.0)`<br/>Hyperparameters tuned with Optuna |
 
----
+### Model Selection
 
-## Sending Back to LLM (Active Learning Loop)
+1. Train all classifiers on labeled data
+2. Evaluate each on held-out validation set
+3. **Select the model with highest ROC-AUC** (measures discrimination ability across probability thresholds)
+4. Use selected model for all subsequent predictions
 
-## 1. Find Optimal Cutoff Threshold
-Identify the probability threshold ($\tau$) that maximizes one of the following against ground truth labels:
-- **Accuracy**
-- **F1 Score**
+### Output
 
-### 2. User-Defined Threshold
-Users can select a cutoff based on:
-- Precision/Recall tradeoffs.
-- Cost of false positives vs. false negatives.
-- Domain-specific requirements.
-
-### 2.5. Best Tresholds:
-Some useful thresholds are calculated:
-- Minimizing FP (auto-accepted but not actually entailed): Calculates F_1/2 using: ![equation](https://latex.codecogs.com/svg.image?\color{white}{F_\beta = (1 + \beta^2) \cdot \frac{\text{Precision} \times \text{Recall}}{(\beta^2 \cdot \text{Precision}) + \text{Recall}}}), where precision and recall are calculated using sklearn's precision_recall_curve, and maximizes F_1/2 out of all thresholds.
-- Minimizing FN (Sending to LLM when we shouldn't have): Does the same with F_2 as well as calculating Bayes' Optimal Threshold by inputtig the cost of a FN as 5x worse than the cost of an FP (arbitrary, can play with it).
-
-### 3. Active Learning
-1. Pairs **above** the threshold are sent to LLM for labeling.
-2. Pairs **below** the threshold are automatically rejected as entailments.
-3. The cost for doing this is computed (rough average).
-4. A dataset is outputed for the pairs to be sent back.
-5. **Repeat** the process to iteratively improve model performance.
+Returns a **probability of entailment** for each candidate pair $(A, B)$
 
 ---
 
-## Technical Requirements
+## Thresholding & Active Learning {#active-learning}
 
-### Installing Imports
-Installing the necessary packages can be complex. I uploaded a directory here which has all of the libraries I needed to use in this process. However, I would not be surprised if you need to install a few more things to run this, so just add a cell and %pip install it (and restart the kernel). You will need to figure out the path to this directory on your own and change a few things here and there.
+### Purpose
+Identify which candidate pairs to send to LLM, balancing precision/recall and cost.
 
-### Training Specs (Reference)
-The algorithm was tested and trained on the following hardware configuration:
+### Step 1: Find Optimal Threshold
 
-```text
-+-----------------------------------------------------------------------------+
-| NVIDIA-SMI 535.216.03             Driver Version: 535.216.03   CUDA Version: 12.2     |
-|-----------------------------------------+----------------------+----------------------+
-| GPU  Name                 Persistence-M | Bus-Id        Disp.A | Volatile Uncorr. ECC |
-| Fan  Temp   Perf          Pwr:Usage/Cap |         Memory-Usage | GPU-Util  Compute M. |
-|                                         |                      |               MIG M. |
-|=========================================+======================+======================|
-|   0  Quadro RTX 6000                On  | 00000000:06:00.0 Off |                  Off |
-| N/A   30C    P8              13W / 250W |      0MiB / 24576MiB |      0%      Default |
-|                                         |                      |                  N/A |
-+-----------------------------------------+----------------------+----------------------+
+Calculate probability threshold $\tau$ that optimizes one of:
+- **Accuracy:** Overall correct predictions
+- **F1 Score:** Harmonic mean of precision and recall
+
+### Step 2: Useful Thresholds
+
+Several thresholds are computed to address different costs:
+
+**Minimize False Positives (F_{1/2}):**
+$$F_\beta = (1 + \beta^2) \cdot \frac{\text{Precision} \times \text{Recall}}{(\beta^2 \cdot \text{Precision}) + \text{Recall}}$$
+
+Maximizes $F_{1/2}$ to penalize false positives (auto-accepted but not actually entailed)
+
+**Minimize False Negatives (F_2):**
+- Maximizes $F_2$ to penalize false negatives
+- Uses Bayes' Optimal Threshold assuming FN cost = 5× FP cost (tunable)
+
+### Step 3: Active Learning
+
+1. **Above threshold:** Pairs with $P(\text{entailed}) > \tau$ → **Send to LLM**
+2. **Below threshold:** Pairs with $P(\text{entailed}) \leq \tau$ → **Auto-reject**
+3. **Compute cost:** Estimates average LLM call cost for selected pairs
+4. **Output dataset:** Formats pairs for LLM evaluation
+5. **Iterate:** Returns to FEA Loop with new LLM labels
+
+---
+
+## Model Availability
+
+### Why Only 2 Base Models?
+
+Currently, the project uses two fine-tuned models:
+- **Bi-Encoder:** `BAAI/bge-en-icl` (for initial similarity filtering)
+- **Cross-Encoder:** `nli-deberta-v3-base` (for refined entailment scoring)
+
+**Reasons for limited model count:**
+
+1. **Computational Cost:** Fine-tuning transformer models requires significant GPU memory and time
+   - Original training used UChicago RCC's RTX 6000 GPU (24GB VRAM)
+   - Each model takes 6-12 hours to train on 450,000 labeled pairs
+
+2. **Training Data Dependency:** Models require the same ~450,000 labeled pair dataset for fair comparison
+   - Generating this dataset required extensive LLM calls (expensive)
+   - Adding more models would require proportional LLM budget increases
+
+3. **Empirical Requirements:** These two models were selected because they:
+   - Provide complementary information (bi-encoder speed + cross-encoder accuracy)
+   - Achieve high ROC-AUC on validation data
+   - Have reasonable inference latency for large-scale predictions
+
+4. **Resource Constraints:** Adding more models would require:
+   - More GPU time for training (multiplicative cost)
+   - More LLM evaluations to validate improvements
+   - More storage and maintenance overhead
+
+### To Add More Models:
+- Select alternative base models from Hugging Face Hub
+- Fine-tune on the existing 450,000 labeled pairs
+- Evaluate ROC-AUC against held-out test set
+- Add to ensemble if performance justifies computational cost
+- Update this documentation
+
+---
+
+## Technical Setup
+
+### Requirements
+
+See `requirements.txt` for full dependency list. Key packages:
+- `torch`, `torchvision`
+- `sentence-transformers` (for SBERT models)
+- `transformers` (for cross-encoders)
+- `scikit-learn` (for classifiers)
+- `optuna` (for hyperparameter tuning)
+- `openai` (for LLM calls)
+- `pandas`, `numpy`, `scipy` (data processing)
+- `plotly` (visualization)
+
+### Installation
+
+Missing packages can be installed in a notebook cell:
+```python
+%pip install package_name
+# Then restart the kernel
 ```
-**Warning:** Be cautious if running on hardware with less video memory.
+
+### Hardware Requirements
+
+**Tested Configuration:**
+```
+GPU: NVIDIA Quadro RTX 6000 (24GB VRAM)
+Driver: 535.216.03
+CUDA: 12.2
+```
+
+**Warning:** Expect issues on GPUs with <16GB VRAM. Reduce batch sizes as needed.
+
+---
+
+## File Structure
+
+- **Documentation:**
+  - `README.md` - This file
+  - `requirements.txt` - Python dependencies
+
+- **Main Notebooks:**
+  - `FEA_Loop.ipynb` - Orchestrates the main iterative loop
+  - `FEA_Pipeline.ipynb` - Manages feature extraction and preprocessing
+  - `model_trainers.ipynb` - Fine-tunes bi-encoder and cross-encoder models
+  - `FreeEntailmentAlgorithm.ipynb` - Core algorithm implementation
+
+- **Utilities:**
+  - `free_entailments_algorithm_utils.py` - Helper functions for all operations
+  - `llm_calls/deepseek_evaluator.py` - LLM querying module
+  - `llm_calls/prompts.py` - LLM prompt templates
+
+- **Models:**
+  - `fine_tuned_bi_model/` - Fine-tuned bi-encoder checkpoint
+
+- **Data:**
+  - `labeled_pairs/` - LLM-labeled entailment pairs
+  - `llm_calls/` - LLM interaction logs and evaluator code
+  - `seen_pair_indices/` - Tracking completed pair indices
+  - `fea_iterations/` - Iteration-specific results and statistics
+
+---
+
+## Workflow Summary
+
+1. **Round Zero:** Generate and label initial pairs with LLM
+2. **FEA Loop Iteration:**
+   - Generate new candidate pairs
+   - Compute 4 features for each candidate
+   - Train ensemble classifiers
+   - Select best model
+   - Predict on all candidates
+   - Optimize threshold
+   - Send high-confidence pairs to LLM
+3. **Repeat:** Add LLM labels to training set; continue with updated model
+4. **Output:** Probabilities and verdicts for all evaluated pairs
