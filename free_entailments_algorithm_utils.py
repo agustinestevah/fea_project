@@ -939,6 +939,74 @@ def merge_pairwise_texts(
     # Reorder columns
     return merged[["id1", "id2", "text1", "text2", "verdict"]]
 
+def create_embedding_cache(
+    df_texts: pd.DataFrame,
+    id_col: str,
+    text_col: str,
+    model_name: str = "BAAI/bge-large-en-v1.5",
+    batch_size: int = 128,
+    show_progress_bar: bool = True
+) -> Dict[str, np.ndarray]:
+    """
+    Pre-compute embeddings for all unique texts and return a cache dictionary.
+    This is the KEY OPTIMIZATION - embed once, reuse everywhere.
+
+    Parameters
+    ----------
+    df_texts : pd.DataFrame
+        DataFrame containing unique IDs and their texts.
+    id_col : str
+        Name of the ID column.
+    text_col : str
+        Name of the text column.
+    model_name : str, default "BAAI/bge-large-en-v1.5"
+        SentenceTransformer model to use.
+    batch_size : int, default 128
+        Batch size for encoding.
+    show_progress_bar : bool, default True
+        Whether to show progress bar during encoding.
+
+    Returns
+    -------
+    dict
+        Dictionary mapping {id: embedding_vector} for all texts.
+    """
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = SentenceTransformer(model_name, device=device)
+    if device == "cuda":
+        model.half()
+
+    # Get unique id-text pairs (in case of duplicates)
+    df_unique = df_texts[[id_col, text_col]].drop_duplicates(subset=[id_col])
+    
+    print(f"\n>>> Creating Embedding Cache")
+    print(f"Model: {model_name}")
+    print(f"Total unique texts: {len(df_unique)}")
+    print(f"Device: {device}")
+    
+    # Encode all texts
+    embeddings = model.encode(
+        df_unique[text_col].tolist(),
+        batch_size=batch_size,
+        show_progress_bar=show_progress_bar,
+        convert_to_tensor=False  # Return numpy arrays for efficiency
+    )
+    
+    # Create dictionary mapping id -> embedding
+    embedding_cache = dict(zip(
+        df_unique[id_col].astype(str),  # Convert IDs to string for consistency
+        embeddings
+    ))
+    
+    # Clean up
+    del model, embeddings
+    torch.cuda.empty_cache()
+    
+    print(f"✓ Embedding cache created: {len(embedding_cache)} entries")
+    print(f"Embedding dimension: {list(embedding_cache.values())[0].shape[0]}\n")
+    
+    return embedding_cache
+
 def add_embeddings_from_cache(
     df: pd.DataFrame,
     embedding_cache: Dict[str, np.ndarray],
