@@ -1,3 +1,0 @@
-iteration,labeled_input,unlabeled_available,pairs_selected,cumulative_labeled,unlabeled_remaining,output_file,entailment_ratio,iteration_cost,cumulative_cost,total_cost
-0,6,1000,1,7,999,labeled_pairs/Results_DS_BtoS_iteration_1.csv,0.0,0.002,0.002,0.004
-1,7,999,1,8,998,labeled_pairs/Results_DS_BtoS_iteration_2.csv,0.0,0.002,0.004,0.004

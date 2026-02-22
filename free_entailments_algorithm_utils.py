@@ -3752,7 +3752,7 @@ def extract_argument_id(sentence_id: str) -> Optional[str]:
     if not isinstance(sentence_id, str):
         return None
     if sentence_id.startswith('S'):
-        return sentence_id[:6] if len(sentence_id) >= 6 else sentence_id
+        return sentence_id[:8] if len(sentence_id) >= 8 else sentence_id
     elif sentence_id.startswith('B'):
         return sentence_id[:5] if len(sentence_id) >= 5 else sentence_id
     return None
