@@ -154,7 +154,7 @@ class EntailmentEvaluator:
             time.sleep(2)
             return {"ERROR": f"API call failed: {str(e)}"}
 
-def batch_process_pairs(evaluator, data: pd.DataFrame, data_args: pd.DataFrame, path_intermediate: str, batch_size: int = 1, workers: int = 100):
+def batch_process_pairs(evaluator, data: pd.DataFrame, data_args: pd.DataFrame, path_intermediate: str, batch_size: int = 100, workers: int = 100):
     """
     Process multiple sentence pairs in parallel, collect the results, and export progress every N results.
     

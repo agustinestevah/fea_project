@@ -801,12 +801,26 @@ def setminus(
 
     c1, c2 = id_cols[0], id_cols[1]
 
-    # Merge-based anti-join (vectorised, scales to 20 M+ rows)
-    df_small_keys = df_small[[c1, c2]].drop_duplicates()
-    df_small_keys['__remove__'] = True
+    # Set-based anti-join: avoids creating a full merge copy of df_big.
+    # df_small is always tiny (≤ 10 k rows), so the set lookup is instant.
+    # Peak extra memory = 75 MB boolean mask + ~32 MB per 2 M-row chunk.
+    remove_set = set(
+        zip(df_small[c1].astype(str), df_small[c2].astype(str))
+    )
 
-    result = df_big.merge(df_small_keys, on=[c1, c2], how='left')
-    result = result[result['__remove__'].isna()].drop(columns='__remove__').copy()
+    n = len(df_big)
+    mask = np.ones(n, dtype=bool)
+    chunk_sz = 2_000_000
+    for lo in range(0, n, chunk_sz):
+        hi = min(lo + chunk_sz, n)
+        ids1 = df_big[c1].iloc[lo:hi].astype(str).tolist()
+        ids2 = df_big[c2].iloc[lo:hi].astype(str).tolist()
+        for j in range(hi - lo):
+            if (ids1[j], ids2[j]) in remove_set:
+                mask[lo + j] = False
+        del ids1, ids2
+
+    result = df_big[mask]
     result.reset_index(drop=True, inplace=True)
 
     print(f"Set difference: {len(df_big):,} - {len(df_small):,} = {len(result):,} rows")
@@ -1108,6 +1122,433 @@ def add_cosine_similarity_from_embeddings(
     
     return df_out
 
+# ================================================================
+# MEMORY-EFFICIENT HELPERS  (for 10M+ pair scale)
+# ================================================================
+
+def add_cosine_similarity_chunked(
+    df: pd.DataFrame,
+    embedding_cache: Dict[str, np.ndarray],
+    id_col1: str,
+    id_col2: str,
+    new_col: str = "cosine_sim",
+    chunk_size: int = 500_000,
+) -> pd.DataFrame:
+    """
+    Memory-efficient cosine-similarity computation from an embedding cache.
+
+    Instead of storing one embedding-vector *per cell* in the DataFrame
+    (which at 75 M rows × 768-dim × float32 × 2 columns ≈ 460 GB),
+    this function processes the data in fixed-size chunks:
+
+    1. For each chunk, extract only that chunk's IDs as strings.
+    2. Look up the two embedding vectors for each pair by ID.
+    3. Stack them into temporary numpy matrices (chunk_size × dim).
+    4. Compute row-wise cosine similarity in bulk.
+    5. Write the result directly into a float64 column.
+
+    Peak extra memory ≈ 2 × chunk_size × dim × 4 bytes (e.g. 3 GB for
+    500 k chunk with 768-dim embeddings) + the output float64 column
+    (600 MB for 75 M rows).
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Must contain *id_col1* and *id_col2*.
+    embedding_cache : dict
+        ``{id_string: np.ndarray}`` of pre-computed embeddings.
+    id_col1, id_col2 : str
+        Column names for the pair IDs.
+    new_col : str, default "cosine_sim"
+        Name of the output column.
+    chunk_size : int, default 500_000
+        Rows per chunk (tune to available RAM).
+
+    Returns
+    -------
+    pd.DataFrame
+        *df* with an additional column *new_col* (modified in-place;
+        a reference is returned for convenience).
+    """
+    n = len(df)
+    cos_sim = np.full(n, np.nan, dtype=np.float64)
+
+    # Determine embedding dimension from the first cache entry
+    sample_emb = next(iter(embedding_cache.values()))
+    dim = sample_emb.shape[0]
+
+    # Get the underlying pandas Series (NOT .astype(str).values which
+    # would allocate a 75M-element numpy array of Python str objects ≈ 5GB)
+    col1_series = df[id_col1]
+    col2_series = df[id_col2]
+
+    n_chunks = (n + chunk_size - 1) // chunk_size
+    for ci in range(n_chunks):
+        lo = ci * chunk_size
+        hi = min(lo + chunk_size, n)
+        sz = hi - lo
+
+        # Extract IDs for THIS chunk only via .iloc → small string list
+        chunk_ids1 = col1_series.iloc[lo:hi].astype(str).tolist()
+        chunk_ids2 = col2_series.iloc[lo:hi].astype(str).tolist()
+
+        emb1 = np.empty((sz, dim), dtype=np.float32)
+        emb2 = np.empty((sz, dim), dtype=np.float32)
+        valid = np.ones(sz, dtype=bool)
+
+        for j in range(sz):
+            e1 = embedding_cache.get(chunk_ids1[j])
+            e2 = embedding_cache.get(chunk_ids2[j])
+            if e1 is None or e2 is None:
+                valid[j] = False
+                emb1[j] = 0.0
+                emb2[j] = 0.0
+            else:
+                emb1[j] = e1
+                emb2[j] = e2
+
+        # Vectorised cosine similarity
+        numer = np.sum(emb1 * emb2, axis=1)
+        norm1 = np.linalg.norm(emb1, axis=1)
+        norm2 = np.linalg.norm(emb2, axis=1)
+        denom = norm1 * norm2
+        chunk_sim = np.where(denom > 0, numer / denom, 0.0)
+        chunk_sim[~valid] = np.nan
+        cos_sim[lo:hi] = chunk_sim
+
+        del emb1, emb2, chunk_ids1, chunk_ids2
+        if (ci + 1) % 10 == 0 or ci == n_chunks - 1:
+            print(f"  cosine-sim chunk {ci + 1}/{n_chunks} done")
+
+    df[new_col] = cos_sim
+    return df
+
+
+def build_equiv_map(
+    df_entailed: pd.DataFrame,
+    id1_col: str = "id1",
+    id2_col: str = "id2",
+    include_self: bool = False,
+) -> Dict[str, set]:
+    """
+    Build an equivalence map from observed entailed pairs.
+
+    Parameters
+    ----------
+    df_entailed : pd.DataFrame
+        Pairs that have been labelled YES (or equivalent).
+    id1_col, id2_col : str
+        Column names.
+    include_self : bool, default False
+        Whether to keep the ID itself in its own equivalence set.
+
+    Returns
+    -------
+    dict[str, set[str]]
+        ``{id: {equivalent_ids}}``
+    """
+    equiv: Dict[str, set] = defaultdict(set)
+    pairs = df_entailed[[id1_col, id2_col]].dropna().astype(str)
+    for a, b in pairs.itertuples(index=False, name=None):
+        pair = {a, b}
+        for x in pair:
+            equiv[x].update(pair)
+    if not include_self:
+        for x in equiv:
+            equiv[x].discard(x)
+    return dict(equiv)
+
+
+def add_alpha_vectorized(
+    df: pd.DataFrame,
+    equiv_map: Dict[str, set],
+    id_col1: str = "id1",
+    id_col2: str = "id2",
+    new_col: str = "alpha",
+    chunk_size: int = 2_000_000,
+) -> pd.DataFrame:
+    """
+    Vectorised alpha-weight column — no ``apply()``, no ``df.copy()``.
+
+    Rules (identical to ``alpha_weight``):
+    - both IDs without equivalents → NaN
+    - only id1 has equivalents     → 1.0
+    - only id2 has equivalents     → 0.0
+    - both have equivalents        → 0.5
+
+    Memory cost: one float64 output array (≈8 bytes/row) + small chunk
+    boolean arrays.  Never materialises full 75 M-element string arrays.
+    """
+    ids_with_equivs = frozenset(k for k, v in equiv_map.items() if v)
+    n = len(df)
+    alpha = np.full(n, np.nan, dtype=np.float64)
+
+    col1 = df[id_col1]
+    col2 = df[id_col2]
+
+    n_chunks = (n + chunk_size - 1) // chunk_size
+    for ci in range(n_chunks):
+        lo = ci * chunk_size
+        hi = min(lo + chunk_size, n)
+
+        h1 = col1.iloc[lo:hi].astype(str).isin(ids_with_equivs).values
+        h2 = col2.iloc[lo:hi].astype(str).isin(ids_with_equivs).values
+
+        alpha[lo:hi] = np.where(
+            h1 & h2, 0.5,
+            np.where(h1 & ~h2, 1.0,
+            np.where(~h1 & h2, 0.0, np.nan))
+        )
+        del h1, h2
+
+    df[new_col] = alpha
+    return df
+
+
+def build_equiv_pair_candidates_from_map(
+    df: pd.DataFrame,
+    equiv_map: Dict[str, set],
+    id1_col: str = "id1",
+    id2_col: str = "id2",
+    chunk_size: int = 2_000_000,
+) -> pd.DataFrame:
+    """
+    Memory-efficient replacement for
+    ``add_equivalents_from_pairs`` → ``build_equiv_pair_candidates``.
+
+    Instead of materialising two list-valued columns across *all* rows
+    (≈ 8 GB of empty Python list objects for 75 M rows), this function:
+
+    1. Processes the DataFrame in chunks to avoid creating 75 M-element
+       string arrays.
+    2. For each chunk, identifies the (small) subset of rows where at
+       least one ID has equivalents.
+    3. Expands only that subset into crossed pairs.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns ``['id1', 'id2']`` — the union of
+        ``(id1 × equivalents_of(id2))`` and ``(id2 × equivalents_of(id1))``.
+    """
+    n = len(df)
+    col1 = df[id1_col]
+    col2 = df[id2_col]
+
+    parts: List[pd.DataFrame] = []
+    n_chunks = (n + chunk_size - 1) // chunk_size
+
+    for ci in range(n_chunks):
+        lo = ci * chunk_size
+        hi = min(lo + chunk_size, n)
+
+        s1 = col1.iloc[lo:hi].astype(str).tolist()
+        s2 = col2.iloc[lo:hi].astype(str).tolist()
+
+        rows: List[Tuple[str, str]] = []
+        for j in range(hi - lo):
+            i1, i2 = s1[j], s2[j]
+            eq1 = equiv_map.get(i1)
+            eq2 = equiv_map.get(i2)
+            if eq2:
+                for k in eq2:
+                    rows.append((i1, k))
+            if eq1:
+                for k in eq1:
+                    rows.append((i2, k))
+
+        if rows:
+            parts.append(pd.DataFrame(rows, columns=["id1", "id2"]))
+        del s1, s2, rows
+
+    if parts:
+        out = pd.concat(parts, ignore_index=True)
+    else:
+        out = pd.DataFrame(columns=["id1", "id2"])
+    return out
+
+
+def compute_neighbor_score_efficient(
+    sigma_lookup: Dict[Tuple[str, str], float],
+    df6: pd.DataFrame,
+    equiv_map: Dict[str, set],
+    id1_col: str = "id1",
+    id2_col: str = "id2",
+    cosim_col: str = "new_cos_sim_score",
+    alpha_col: str = "alpha",
+    new_col: str = "cos_sim_neighbor_score",
+    chunk_size: int = 2_000_000,
+) -> pd.DataFrame:
+    """
+    Memory-efficient neighbor-weighted score (replaces ``compute_neighbor_weighted_score``).
+
+    Key optimisations
+    -----------------
+    * **Chunked ID extraction**: Never materialises 75 M-element string
+      arrays; processes IDs in 2 M-row chunks.
+    * **Short-circuit**: For the vast majority of rows where *both*
+      equivalence sets are empty, score = σ(i, j) directly.
+    * **No list columns**: Equivalences are looked up from *equiv_map*
+      on the fly for the small subset of rows that need them.
+    * **No df.copy()**: The result column is written in-place.
+    """
+    n = len(df6)
+    scores = np.full(n, np.nan, dtype=np.float64)
+
+    # The cosine-sim and alpha columns are plain float64 — safe to pull at once
+    alphas = df6[alpha_col].values.astype(np.float64)
+    sigma_ij_arr = df6[cosim_col].values.astype(np.float64)
+
+    ids_with = frozenset(k for k, v in equiv_map.items() if v)
+
+    col1 = df6[id1_col]
+    col2 = df6[id2_col]
+
+    # Collect indices of rows that need per-row neighbor computation
+    neighbor_indices: List[int] = []
+
+    n_chunks = (n + chunk_size - 1) // chunk_size
+    for ci in range(n_chunks):
+        lo = ci * chunk_size
+        hi = min(lo + chunk_size, n)
+
+        chunk_s1 = col1.iloc[lo:hi].astype(str).tolist()
+        chunk_s2 = col2.iloc[lo:hi].astype(str).tolist()
+
+        for j in range(hi - lo):
+            h1 = chunk_s1[j] in ids_with
+            h2 = chunk_s2[j] in ids_with
+            if h1 or h2:
+                neighbor_indices.append(lo + j)
+            else:
+                # Bulk shortcut: no neighbours → score = σ_ij
+                scores[lo + j] = sigma_ij_arr[lo + j]
+        del chunk_s1, chunk_s2
+
+    print(f"  neighbor score: {len(neighbor_indices):,} / {n:,} rows need "
+          f"neighbour computation ({100 * len(neighbor_indices) / max(n, 1):.1f}%)")
+
+    def _get_sigma(a: str, b: str) -> float:
+        return sigma_lookup.get((a, b), np.nan)
+
+    def _mean_sigma(anchor: str, others: set) -> float:
+        vals = [_get_sigma(anchor, k) for k in others if k != anchor]
+        vals = [v for v in vals if not np.isnan(v)]
+        return float(np.mean(vals)) if vals else 0.0
+
+    # Only need string lookups for the (small) neighbor subset
+    for idx in neighbor_indices:
+        i = str(col1.iat[idx])
+        j = str(col2.iat[idx])
+        alpha = alphas[idx]
+        sigma_ij = sigma_ij_arr[idx]
+
+        if np.isnan(sigma_ij):
+            continue  # stays NaN
+
+        eq_i = equiv_map.get(i, set()) - {i}
+        eq_j = equiv_map.get(j, set()) - {j}
+
+        if len(eq_i) == 0 and len(eq_j) == 0:
+            scores[idx] = sigma_ij
+            continue
+
+        if np.isnan(alpha):
+            continue  # stays NaN
+
+        term_i = alpha * _mean_sigma(j, eq_i) if (alpha != 0 and eq_i) else 0.0
+        term_j = (1.0 - alpha) * _mean_sigma(i, eq_j) if (alpha != 1 and eq_j) else 0.0
+        scores[idx] = sigma_ij * (term_i + term_j)
+
+    df6[new_col] = scores
+    return df6
+
+
+def prepare_candidates_efficient(
+    df_obs_ent: pd.DataFrame,
+    df_predict: pd.DataFrame,
+    df_clause: pd.DataFrame,
+    obs_id_cols: Tuple[str, str] = ("id1", "id2"),
+    predict_id_cols: Tuple[str, str] = ("id1", "id2"),
+    clause_id_col: str = "sentence_id",
+    clause_text_col: str = "sentence",
+) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, set]]:
+    """
+    Memory-efficient replacement for the four-function chain:
+
+        add_equivalents_from_pairs
+        → add_alpha_weight_column
+        → build_equiv_pair_candidates
+        → merge_pairwise_texts
+
+    Instead of storing Python list objects in every row of *df_predict*
+    (≈ 8 GB overhead for 75 M rows), this function:
+
+    1. Builds a compact ``equiv_map`` (dict of sets).
+    2. Computes alpha weights with vectorised ``isin()`` (no ``apply()``).
+    3. Generates crossed pairs directly from the map for only the
+       relevant subset of rows.
+    4. Merges clause texts only onto the (much smaller) crossed-pairs df.
+
+    Parameters
+    ----------
+    df_obs_ent : pd.DataFrame
+        Observed entailed pairs (verdict == YES).
+    df_predict : pd.DataFrame
+        Candidate pairs (the large pool, e.g. 75 M rows).
+    df_clause : pd.DataFrame
+        All clauses with *clause_id_col* and *clause_text_col*.
+    obs_id_cols : tuple of str
+        (id1, id2) column names in *df_obs_ent*.
+    predict_id_cols : tuple of str
+        (id1, id2) column names in *df_predict*.
+    clause_id_col, clause_text_col : str
+        Column names in *df_clause*.
+
+    Returns
+    -------
+    (df_predict, df_crossed, equiv_map)
+        * df_predict — same object with an ``alpha`` column added in-place.
+        * df_crossed — crossed pairs with ``id1 id2 text1 text2``.
+        * equiv_map — ``dict[str, set[str]]`` for later use.
+    """
+    # 1. Equivalence map
+    equiv_map = build_equiv_map(
+        df_obs_ent,
+        id1_col=obs_id_cols[0],
+        id2_col=obs_id_cols[1],
+        include_self=False,
+    )
+    print(f"  equiv_map: {len(equiv_map)} IDs with equivalents")
+
+    # 2. Alpha (vectorised, in-place)
+    add_alpha_vectorized(
+        df_predict,
+        equiv_map,
+        id_col1=predict_id_cols[0],
+        id_col2=predict_id_cols[1],
+    )
+
+    # 3. Crossed pairs (from map, no list columns)
+    df_crossed = build_equiv_pair_candidates_from_map(
+        df_predict,
+        equiv_map,
+        id1_col=predict_id_cols[0],
+        id2_col=predict_id_cols[1],
+    )
+    print(f"  crossed pairs: {len(df_crossed):,} rows")
+
+    # 4. Merge texts onto crossed pairs only
+    df_crossed = merge_pairwise_texts(
+        df1=df_clause,
+        df2=df_crossed,
+        df1_cols=[clause_id_col, clause_text_col],
+        df2_cols=["id1", "id2"],
+    )
+
+    return df_predict, df_crossed, equiv_map
+
+
 def add_cosine_similarity_from_text(
     df: pd.DataFrame,
     text_col1: str,
@@ -1162,6 +1603,16 @@ def add_cosine_similarity_from_text(
             df[new_col] = pd.Series(dtype=float)
             return df
         
+        # For large DataFrames (>5M rows), use memory-efficient chunked path
+        # to avoid storing 2 embedding-vector columns in the DataFrame.
+        LARGE_THRESHOLD = 5_000_000
+        if len(df) > LARGE_THRESHOLD:
+            print(f"Using chunked cosine-similarity path ({len(df):,} rows)...")
+            return add_cosine_similarity_chunked(
+                df, embedding_cache, id_col1, id_col2,
+                new_col=new_col, chunk_size=500_000,
+            )
+
         print(f"Using pre-computed embeddings from cache...")
         
         # Add embeddings from cache
@@ -1914,6 +2365,123 @@ def add_graph_features(
     return df
 
 
+def add_graph_features_vectorized(
+    df: pd.DataFrame,
+    entailment_df: pd.DataFrame,
+    id1_col: str = "id1",
+    id2_col: str = "id2",
+    verdict_col: str = "verdict",
+    positive_label: str = "YES",
+    decay: float = 0.9,
+    max_hops: int = 5,
+) -> pd.DataFrame:
+    """
+    Vectorized version of :func:`add_graph_features` suitable for millions of rows.
+
+    Instead of running BFS per row (O(|df| * (V+E))), this:
+
+    1. Builds the directed entailment graph.
+    2. Runs *one* BFS from every unique node that has outgoing edges
+       (limited to *max_hops*).  With a sparse graph this is extremely fast.
+    3. Stores all reachable (source, target) → distance in a flat dict.
+    4. Vectorised lookup via ``pd.Series.map()`` for all rows.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame with (id1, id2) pairs to score.
+    entailment_df : pd.DataFrame
+        Known entailments with a *verdict_col* column.
+    id1_col, id2_col : str
+        Column names for the pair IDs.
+    verdict_col : str
+        Column that holds the entailment label.
+    positive_label : str
+        Value in *verdict_col* indicating positive entailment.
+    decay : float
+        Decay factor applied per hop (score = decay^(hops-1)).
+    max_hops : int
+        Maximum BFS depth.
+
+    Returns
+    -------
+    pd.DataFrame
+        *df* with ``graph_entailment_score`` and ``graph_equivalence_score``
+        columns added in-place.
+    """
+    from collections import deque
+
+    # 1. Build directed graph
+    graph: Dict[str, set] = defaultdict(set)
+    positives = entailment_df[entailment_df[verdict_col] == positive_label]
+    for row in positives.itertuples(index=False):
+        u = str(getattr(row, id1_col))
+        v = str(getattr(row, id2_col))
+        graph[u].add(v)
+
+    print(f"  Graph: {len(graph)} source nodes, "
+          f"{sum(len(v) for v in graph.values())} edges")
+
+    # 2. BFS from every source node (only nodes with outgoing edges matter)
+    #    Returns {target_node: hop_distance} for reachable targets within max_hops.
+    def _bfs(start: str) -> Dict[str, int]:
+        dists: Dict[str, int] = {}
+        queue = deque([(start, 0)])
+        visited = {start}
+        while queue:
+            node, depth = queue.popleft()
+            if depth > 0:
+                dists[node] = depth
+            if depth >= max_hops:
+                continue
+            for neighbour in graph.get(node, ()):
+                if neighbour not in visited:
+                    visited.add(neighbour)
+                    queue.append((neighbour, depth + 1))
+        return dists
+
+    # Collect all unique nodes that appear in df AND have outgoing edges in graph
+    ids1 = df[id1_col].astype(str)
+    ids2 = df[id2_col].astype(str)
+    nodes_to_bfs = (set(ids1) | set(ids2)) & set(graph.keys())
+
+    print(f"  BFS from {len(nodes_to_bfs)} nodes (max_hops={max_hops})...")
+
+    # Flat lookup:  "source|target" → hop distance
+    pair_dist: Dict[str, int] = {}
+    for src in nodes_to_bfs:
+        for tgt, d in _bfs(src).items():
+            pair_dist[f"{src}|{tgt}"] = d
+
+    print(f"  Reachable pairs: {len(pair_dist):,}")
+
+    # 3. Vectorised lookup
+    keys_ab = ids1 + '|' + ids2
+    keys_ba = ids2 + '|' + ids1
+
+    dist_ab = keys_ab.map(pair_dist)
+    dist_ba = keys_ba.map(pair_dist)
+
+    # 4. Compute scores
+    fwd = np.where(dist_ab.notna(), decay ** (dist_ab.fillna(0) - 1), 0.0)
+    bwd = np.where(dist_ba.notna(), decay ** (dist_ba.fillna(0) - 1), 0.0)
+    bidir = np.where(
+        dist_ab.notna() & dist_ba.notna(),
+        np.sqrt(fwd * bwd),
+        0.0,
+    )
+
+    df['graph_entailment_score'] = fwd.astype(np.float32)
+    df['graph_equivalence_score'] = bidir.astype(np.float32)
+
+    n_nonzero_ent = (df['graph_entailment_score'] > 0).sum()
+    n_nonzero_eq  = (df['graph_equivalence_score'] > 0).sum()
+    print(f"  ✓ graph_entailment_score: {n_nonzero_ent:,} non-zero / {len(df):,}")
+    print(f"  ✓ graph_equivalence_score: {n_nonzero_eq:,} non-zero / {len(df):,}")
+
+    return df
+
+
 ### PREDICT ENTAILMENT
 def train_entailment_model(
     df: pd.DataFrame,
@@ -2014,34 +2582,34 @@ def predict_entailment_probabilities(
     model_pipeline,
     feature_cols: List[str],
     new_col: str = "entailment_prob",
-    transitivity_col: str = "transitivity_score"
+    transitivity_col: str = "transitivity_score",
+    chunk_size: int = 2_000_000,
 ) -> pd.DataFrame:
     """
     Uses the trained regression model to predict probability (0 to 1).
-    
-    Hard Constraint:
-    If 'transitivity_col' is present, any row with transitivity_score == 1.0 
-    will have its probability FORCED to 1.0, overriding the model.
+    Modified: works IN-PLACE (no df.copy()) and predicts in chunks to
+    avoid allocating a 75 M-row feature matrix at once.
     """
-    df_out = df.copy()
-    
-    # Handle rows that might have NaN features by skipping them or filling
-    mask_valid = df_out[feature_cols].notna().all(axis=1)
-    
-    if mask_valid.any():
-        X = df_out.loc[mask_valid, feature_cols].values
-        # predict_proba returns [prob_class_0, prob_class_1]
-        probs = model_pipeline.predict_proba(X)[:, 1]
-        df_out.loc[mask_valid, new_col] = probs
-    
-    # Default NaNs
-    df_out.loc[~mask_valid, new_col] = np.nan
-    
-    # --- Transitivity Override ---
-    # Disabled upon request: We no longer force probability to 1.0 even if transitivity is 1.0.
-    # The model should learn to trust this feature if it's reliable.
-    
-    return df_out
+    n = len(df)
+    probs_all = np.full(n, np.nan, dtype=np.float64)
+
+    mask_valid = df[feature_cols].notna().all(axis=1).values
+
+    valid_idx = np.where(mask_valid)[0]
+    if len(valid_idx) > 0:
+        # Predict in chunks to limit peak RAM
+        n_pred_chunks = (len(valid_idx) + chunk_size - 1) // chunk_size
+        for ci in range(n_pred_chunks):
+            clo = ci * chunk_size
+            chi = min(clo + chunk_size, len(valid_idx))
+            idx_slice = valid_idx[clo:chi]
+            X_chunk = df.iloc[idx_slice][feature_cols].values
+            probs_chunk = model_pipeline.predict_proba(X_chunk)[:, 1]
+            probs_all[idx_slice] = probs_chunk
+            del X_chunk, probs_chunk
+
+    df[new_col] = probs_all
+    return df
 
 def compare_entailment_models(
     df: pd.DataFrame,
@@ -2743,31 +3311,35 @@ def generate_final_df(
         Filtered DataFrame with selected columns.
     """
     mask = df[prob_col] > threshold
+    n_total = len(df)
     
+    # FILTER FIRST — on 75M rows, only ~1k pass the threshold, so we
+    # restrict all subsequent work to the tiny filtered subset.
+    df_filtered = df.loc[mask].copy()
+
     # Handle renaming only if prob_col is different but 'entailment_probability' is requested
-    df_temp = df.copy()
     if prob_col != 'entailment_probability' and 'entailment_probability' in keep_cols:
-        df_temp = df_temp.rename(columns={prob_col: 'entailment_probability'})
+        df_filtered = df_filtered.rename(columns={prob_col: 'entailment_probability'})
 
     # Lazy text lookup: add text1/text2 from df_clause if missing
     if df_clause is not None:
         _id_to_text = dict(zip(df_clause[id_col].astype(str), df_clause[text_col]))
-        if 'text1' not in df_temp.columns and 'text1' in keep_cols:
-            df_temp['text1'] = df_temp['id1'].astype(str).map(_id_to_text)
-        if 'text2' not in df_temp.columns and 'text2' in keep_cols:
-            df_temp['text2'] = df_temp['id2'].astype(str).map(_id_to_text)
+        if 'text1' not in df_filtered.columns and 'text1' in keep_cols:
+            df_filtered['text1'] = df_filtered['id1'].astype(str).map(_id_to_text)
+        if 'text2' not in df_filtered.columns and 'text2' in keep_cols:
+            df_filtered['text2'] = df_filtered['id2'].astype(str).map(_id_to_text)
 
     # Ensure columns exist before selecting
-    missing = [c for c in keep_cols if c not in df_temp.columns]
+    missing = [c for c in keep_cols if c not in df_filtered.columns]
     if missing:
         raise ValueError(f"Missing required columns for final output: {missing}. "
                          f"Pass df_clause= to auto-add text columns.")
         
-    df_out = df_temp.loc[mask, keep_cols].copy()
+    df_out = df_filtered[keep_cols]
     
-    print(f"--- Generating LLM Batch ---")
-    print(f"Original Count: {len(df):,}")
-    pct = f"{(len(df_out)/len(df)):.1%}" if len(df) > 0 else "N/A"
+    print("--- Generating LLM Batch ---")
+    print(f"Original Count: {n_total:,}")
+    pct = f"{(len(df_out)/n_total):.1%}" if n_total > 0 else "N/A"
     print(f"Filtered Count: {len(df_out):,} ({pct})")
     print(f"Condition:      P > {threshold:.4f} (Send High Confidence Pairs)")
     
@@ -3649,29 +4221,37 @@ def load_pipeline_data(
 
 def run_fea_papermill(
     iteration_number: int,
-    df_candidates: pd.DataFrame,
-    df_crossed: pd.DataFrame,
-    df_labeled: pd.DataFrame,
-    df_labeled_crossed: pd.DataFrame,
-    df_obs_ent: pd.DataFrame,
-    df_clause: pd.DataFrame,
-    embedding_cache: dict,
+    df_candidates: pd.DataFrame = None,
+    df_crossed: pd.DataFrame = None,
+    df_labeled: pd.DataFrame = None,
+    df_labeled_crossed: pd.DataFrame = None,
+    df_obs_ent: pd.DataFrame = None,
+    df_clause: pd.DataFrame = None,
+    embedding_cache: dict = None,
     temp_dir: str = "fea_iterations/temp_data",
+    data_on_disk: bool = False,
 ) -> Tuple[pd.DataFrame, str]:
     """
-    Save intermediate DataFrames to disk, run FreeEntailmentAlgorithm.ipynb
-    via papermill, and retrieve `df_final` and `fig_html` from scrapbook.
+    Run FreeEntailmentAlgorithm.ipynb via papermill and retrieve results.
+
+    When ``data_on_disk=False`` (default, backward-compatible), saves all
+    DataFrames to disk first.  When ``data_on_disk=True``, assumes the
+    caller has already pickled everything to *temp_dir* and freed memory.
 
     Parameters
     ----------
     iteration_number : int
         Current iteration index.
     df_candidates, df_crossed, df_labeled, df_labeled_crossed, df_obs_ent, df_clause
-        DataFrames produced by the FEA Pipeline.
+        DataFrames produced by the FEA Pipeline (ignored when *data_on_disk*).
     embedding_cache : dict
-        Pre-computed embedding cache.
+        Pre-computed embedding cache (ignored when *data_on_disk*).
     temp_dir : str
         Directory for temporary pickle files.
+    data_on_disk : bool, default False
+        If True, skip pickling — the caller already saved everything to
+        *temp_dir* and freed the large DataFrames to reclaim RAM before
+        FreeEntailmentAlgorithm spawns a new process.
 
     Returns
     -------
@@ -3683,25 +4263,32 @@ def run_fea_papermill(
 
     os.makedirs(temp_dir, exist_ok=True)
 
-    # Short-circuit: if df_candidates or df_obs_ent are empty, there's nothing
-    # for FreeEntailmentAlgorithm to train on — return empty results immediately.
-    if len(df_candidates) == 0 or len(df_obs_ent) == 0:
-        print(f"⚠ Skipping FreeEntailmentAlgorithm (empty data: "
-              f"{len(df_candidates)} candidates, {len(df_obs_ent)} entailed pairs)")
-        df_final = pd.DataFrame(columns=['id1', 'id2', 'text1', 'text2', 'entailment_probability'])
-        fig_html = "<p>No data for this iteration</p>"
-        return df_final, fig_html
+    if not data_on_disk:
+        # Short-circuit: if df_candidates or df_obs_ent are empty, there's nothing
+        # for FreeEntailmentAlgorithm to train on — return empty results immediately.
+        if len(df_candidates) == 0 or len(df_obs_ent) == 0:
+            print(f"⚠ Skipping FreeEntailmentAlgorithm (empty data: "
+                  f"{len(df_candidates)} candidates, {len(df_obs_ent)} entailed pairs)")
+            df_final = pd.DataFrame(columns=['id1', 'id2', 'text1', 'text2', 'entailment_probability'])
+            fig_html = "<p>No data for this iteration</p>"
+            return df_final, fig_html
 
-    df_candidates.to_pickle(f"{temp_dir}/df_candidates.pkl")
-    df_crossed.to_pickle(f"{temp_dir}/df_crossed.pkl")
-    df_labeled.to_pickle(f"{temp_dir}/df_labeled.pkl")
-    df_labeled_crossed.to_pickle(f"{temp_dir}/df_labeled_crossed.pkl")
-    df_obs_ent.to_pickle(f"{temp_dir}/df_obs_ent.pkl")
-    df_clause.to_pickle(f"{temp_dir}/df_clause.pkl")
+        df_candidates.to_pickle(f"{temp_dir}/df_candidates.pkl")
+        print(f"  df_candidates pickled: {len(df_candidates):,} rows, "
+              f"cols={list(df_candidates.columns)}")
+        df_crossed.to_pickle(f"{temp_dir}/df_crossed.pkl")
+        df_labeled.to_pickle(f"{temp_dir}/df_labeled.pkl")
+        df_labeled_crossed.to_pickle(f"{temp_dir}/df_labeled_crossed.pkl")
+        df_obs_ent.to_pickle(f"{temp_dir}/df_obs_ent.pkl")
+        df_clause.to_pickle(f"{temp_dir}/df_clause.pkl")
 
-    with open(f"{temp_dir}/embedding_cache.pkl", 'wb') as f:
-        pickle.dump(embedding_cache, f)
+        if embedding_cache is not None:
+            with open(f"{temp_dir}/embedding_cache.pkl", 'wb') as f:
+                pickle.dump(embedding_cache, f)
 
+    # Only pass embedding_cache_path if the file exists (cosine sims may
+    # already be pre-computed in the DataFrames by Pipeline).
+    _emb_cache_pkl = f"{temp_dir}/embedding_cache.pkl"
     parameters = {
         "df_candidates_path": f"{temp_dir}/df_candidates.pkl",
         "df_crossed_path": f"{temp_dir}/df_crossed.pkl",
@@ -3709,7 +4296,7 @@ def run_fea_papermill(
         "df_labeled_crossed_path": f"{temp_dir}/df_labeled_crossed.pkl",
         "df_obs_ent_path": f"{temp_dir}/df_obs_ent.pkl",
         "df_clause_path": f"{temp_dir}/df_clause.pkl",
-        "embedding_cache_path": f"{temp_dir}/embedding_cache.pkl",
+        "embedding_cache_path": _emb_cache_pkl if os.path.exists(_emb_cache_pkl) else "",
     }
 
     output_notebook_path = f"fea_iterations/FEA_iter_{iteration_number}.ipynb"
@@ -3722,9 +4309,25 @@ def run_fea_papermill(
         parameters=parameters,
     )
 
-    nb = sb.read_notebook(output_notebook_path)
-    df_final = nb.scraps['df_final'].data
-    fig_html = nb.scraps['fig_html'].data
+    # Read outputs from pickle files (NOT scrapbook — scrapbook's JSON
+    # serialization through Jupyter messaging OOMs at 75 M-candidate scale).
+    df_final_path = f"{temp_dir}/df_final.pkl"
+    fig_html_path = f"{temp_dir}/fig_html.pkl"
+
+    if os.path.exists(df_final_path):
+        df_final = pd.read_pickle(df_final_path)
+    else:
+        # Fallback to scrapbook if pickle wasn't written (shouldn't happen)
+        nb = sb.read_notebook(output_notebook_path)
+        df_final = nb.scraps['df_final'].data
+
+    if os.path.exists(fig_html_path):
+        with open(fig_html_path, 'rb') as f:
+            fig_html = pickle.load(f)
+    else:
+        if 'nb' not in locals():
+            nb = sb.read_notebook(output_notebook_path)
+        fig_html = nb.scraps.get('fig_html', type('', (), {'data': '<p>Plot unavailable</p>'})).data
 
     print(f"✓ Retrieved outputs:")
     print(f"  - df_final: {len(df_final)} rows")
@@ -3886,16 +4489,27 @@ def finalize_pipeline_iteration(
         if matched < len(df_to_llm_with_results):
             print(f"⚠ Warning: {len(df_to_llm_with_results) - matched} pairs have no mock LLM data")
 
-        # Vectorised anti-join for test mode
-        df_sent_keys = df_to_llm[['sentence_id_1', 'sentence_id_2']].drop_duplicates()
-        df_sent_keys['__sent__'] = True
-        before_n = len(remaining_llm_calls)
-        remaining_llm_calls = remaining_llm_calls.merge(
-            df_sent_keys, on=['sentence_id_1', 'sentence_id_2'], how='left'
+        # Set-based anti-join for test mode
+        remove_set = set(
+            zip(
+                df_to_llm['sentence_id_1'].astype(str),
+                df_to_llm['sentence_id_2'].astype(str),
+            )
         )
-        remaining_llm_calls = remaining_llm_calls[
-            remaining_llm_calls['__sent__'].isna()
-        ].drop(columns='__sent__').copy()
+        before_n = len(remaining_llm_calls)
+        n = len(remaining_llm_calls)
+        mask = np.ones(n, dtype=bool)
+        chunk_sz = 2_000_000
+        for lo in range(0, n, chunk_sz):
+            hi = min(lo + chunk_sz, n)
+            ids1 = remaining_llm_calls['sentence_id_1'].iloc[lo:hi].astype(str).tolist()
+            ids2 = remaining_llm_calls['sentence_id_2'].iloc[lo:hi].astype(str).tolist()
+            for j in range(hi - lo):
+                if (ids1[j], ids2[j]) in remove_set:
+                    mask[lo + j] = False
+            del ids1, ids2
+
+        remaining_llm_calls = remaining_llm_calls[mask]
         remaining_llm_calls.reset_index(drop=True, inplace=True)
         removed = before_n - len(remaining_llm_calls)
 
@@ -3915,14 +4529,29 @@ def finalize_pipeline_iteration(
         # Track in llm_labeled_pairs
         append_to_llm_labeled_pairs(df_to_llm)
 
-        # Vectorised anti-join (scales to tens of millions of rows)
-        df_sent_keys = df_to_llm[['sentence_id_1', 'sentence_id_2']].rename(
-            columns={'sentence_id_1': 'id1', 'sentence_id_2': 'id2'}
-        ).drop_duplicates()
-        df_sent_keys['__sent__'] = True
+        # Set-based anti-join — avoids creating a full 75M-row merge copy.
+        # df_to_llm is tiny (≤ 1 k rows), so the set lookup is instant.
+        remove_set = set(
+            zip(
+                df_to_llm['sentence_id_1'].astype(str),
+                df_to_llm['sentence_id_2'].astype(str),
+            )
+        )
+        # Map column names: df_to_llm uses sentence_id_1/2, unlabeled uses id1/id2
         before_n = len(unlabeled_pairs)
-        unlabeled_pairs = unlabeled_pairs.merge(df_sent_keys, on=['id1', 'id2'], how='left')
-        unlabeled_pairs = unlabeled_pairs[unlabeled_pairs['__sent__'].isna()].drop(columns='__sent__').copy()
+        n = len(unlabeled_pairs)
+        mask = np.ones(n, dtype=bool)
+        chunk_sz = 2_000_000
+        for lo in range(0, n, chunk_sz):
+            hi = min(lo + chunk_sz, n)
+            ids1 = unlabeled_pairs['id1'].iloc[lo:hi].astype(str).tolist()
+            ids2 = unlabeled_pairs['id2'].iloc[lo:hi].astype(str).tolist()
+            for j in range(hi - lo):
+                if (ids1[j], ids2[j]) in remove_set:
+                    mask[lo + j] = False
+            del ids1, ids2
+
+        unlabeled_pairs = unlabeled_pairs[mask]
         unlabeled_pairs.reset_index(drop=True, inplace=True)
         removed = before_n - len(unlabeled_pairs)
 
