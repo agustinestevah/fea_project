@@ -94,6 +94,9 @@ def generate_valid_pairs(
     top_k_bs: Optional[int] = None,
     exclude_labeled_csv: Optional[str] = "labeled_pairs/llm_labeled_pairs.csv",
     seen_indices_dir: Optional[str] = None,
+    model_pipeline=None,
+    model_tau: Optional[float] = None,
+    model_feature_name: str = 'cos_sim_neighbor_score',
 ) -> pd.DataFrame:
     """
     Generate valid pairwise combinations from premise and conclusion dataframes.
@@ -170,6 +173,19 @@ def generate_valid_pairs(
         ``{dir}/seen_premises_bb.npy``, ``seen_premises_bs.npy``,
         ``seen_conclusions_bb.npy``, ``seen_conclusions_bs.npy``.
         Set to ``None`` to disable (original behaviour).
+    model_pipeline : sklearn Pipeline or None, default=None
+        Trained model pipeline that predicts P(entailment) from a single
+        feature (cosine similarity).  When provided together with
+        ``model_tau``, each batch of cosine-filtered pairs is immediately
+        scored and only pairs with P(ent) >= ``model_tau`` are kept.
+        This avoids ever materialising the full pool of cosine-passing
+        pairs, keeping memory bounded.
+    model_tau : float or None, default=None
+        Decision threshold for the model.  A pair is kept only when
+        ``model_pipeline.predict_proba(...)[:, 1] >= model_tau``.
+    model_feature_name : str, default='cos_sim_neighbor_score'
+        Name of the feature column the model expects.  The raw cosine
+        similarity is mapped to this name before prediction.
     
     Returns
     -------
@@ -192,6 +208,11 @@ def generate_valid_pairs(
     # ================================================================
     if embedding_cache is not None and threshold_bb is not None and threshold_bs is not None:
         import gc
+
+        _use_model = model_pipeline is not None and model_tau is not None
+        if _use_model:
+            print(f"  Model-based inline filtering ACTIVE  "
+                  f"(tau={model_tau:.4f}, feature='{model_feature_name}')")
 
         df_all = pd.concat([df_p, df_sc]).drop_duplicates(subset=id_col)
         id_to_text = dict(zip(df_all[id_col], df_all[text_col]))
@@ -229,9 +250,19 @@ def generate_valid_pairs(
 
                 rows, cols = np.where(sims >= threshold_bb)
                 if len(rows) > 0:
-                    bb_i1_parts.append(start + rows)
-                    bb_i2_parts.append(start + cols)
-                    bb_sim_parts.append(sims[rows, cols])
+                    batch_cosines = sims[rows, cols]
+                    # --- Inline model scoring (if supplied) ---
+                    if _use_model:
+                        _feat = batch_cosines.reshape(-1, 1)
+                        _proba = model_pipeline.predict_proba(_feat)[:, 1]
+                        _keep = _proba >= model_tau
+                        rows, cols, batch_cosines = rows[_keep], cols[_keep], batch_cosines[_keep]
+                        del _feat, _proba, _keep
+                    if len(rows) > 0:
+                        bb_i1_parts.append(start + rows)
+                        bb_i2_parts.append(start + cols)
+                        bb_sim_parts.append(batch_cosines)
+                    del batch_cosines
                 del sims
 
             if bb_i1_parts:
@@ -250,7 +281,9 @@ def generate_valid_pairs(
 
             del bb_i1_parts, bb_i2_parts, bb_sim_parts
             gc.collect()
-            print(f"    [{label}] Found {len(df_bb):,} B-B pairs above threshold {threshold_bb:.4f}")
+            _bb_msg = (f"above threshold {threshold_bb:.4f}"
+                       + (f" & model tau {model_tau:.4f}" if _use_model else ""))
+            print(f"    [{label}] Found {len(df_bb):,} B-B pairs {_bb_msg}")
 
             # ---------- B-S pairs (double-batched: batch books AND speech) ----------
             if n_speech > 0:
@@ -278,9 +311,19 @@ def generate_valid_pairs(
 
                         rows, cols = np.where(sims >= threshold_bs)
                         if len(rows) > 0:
-                            bs_i1_parts.append(b_start + rows)
-                            bs_i2_parts.append(s_start + cols)
-                            bs_sim_parts.append(sims[rows, cols])
+                            batch_cosines = sims[rows, cols]
+                            # --- Inline model scoring (if supplied) ---
+                            if _use_model:
+                                _feat = batch_cosines.reshape(-1, 1)
+                                _proba = model_pipeline.predict_proba(_feat)[:, 1]
+                                _keep = _proba >= model_tau
+                                rows, cols, batch_cosines = rows[_keep], cols[_keep], batch_cosines[_keep]
+                                del _feat, _proba, _keep
+                            if len(rows) > 0:
+                                bs_i1_parts.append(b_start + rows)
+                                bs_i2_parts.append(s_start + cols)
+                                bs_sim_parts.append(batch_cosines)
+                            del batch_cosines
                         del sims
 
                     del book_batch
@@ -304,7 +347,9 @@ def generate_valid_pairs(
 
                 del bs_i1_parts, bs_i2_parts, bs_sim_parts
                 gc.collect()
-                print(f"    [{label}] Found {len(df_bs):,} B-S pairs above threshold {threshold_bs:.4f}")
+                _bs_msg = (f"above threshold {threshold_bs:.4f}"
+                           + (f" & model tau {model_tau:.4f}" if _use_model else ""))
+                print(f"    [{label}] Found {len(df_bs):,} B-S pairs {_bs_msg}")
 
                 # --- Trim BS to top_k_bs right away to save memory ---
                 if top_k_bs is not None and len(df_bs) > top_k_bs:
@@ -4932,6 +4977,53 @@ def run_fea_loop(
                 print(f"⚠ WARNING: Unlabeled count mismatch! Expected {unlabeled_pool}, got {actual_unlabeled} in pickle")
                 print(f"   This means FEA_Pipeline may not be properly updating unlabeled_pairs")
                 unlabeled_pool = actual_unlabeled
+
+        # --- Re-score unlabeled pool with this iteration's model --------
+        # FreeEntailmentAlgorithm saved best_pipeline + tau to temp_data/.
+        # We predict each pair's entailment probability (using cosine_sim as
+        # a proxy for cos_sim_neighbor_score) and drop pairs below tau.
+        # This keeps only pairs the *current* model considers plausibly entailed.
+        _model_info_path = os.path.join(output_dir, "temp_data", "model_info.json")
+        _pipeline_path   = os.path.join(output_dir, "temp_data", "best_pipeline.pkl")
+        if (not test
+            and unlabeled_pairs is not None
+            and len(unlabeled_pairs) > 0
+            and os.path.exists(_model_info_path)
+            and os.path.exists(_pipeline_path)):
+            import json as _json
+            with open(_model_info_path) as _f:
+                _minfo = _json.load(_f)
+            with open(_pipeline_path, 'rb') as _f:
+                _pipeline = pickle.load(_f)
+            _tau   = _minfo['tau']
+            _feats = _minfo['features']  # e.g. ['cos_sim_neighbor_score']
+
+            _before = len(unlabeled_pairs)
+            # Map cosine_sim → the feature name the model expects
+            _score_col = 'cosine_sim'
+            if _score_col in unlabeled_pairs.columns:
+                _X = unlabeled_pairs[[_score_col]].rename(
+                    columns={_score_col: _feats[0]}
+                )
+                _probs = _pipeline.predict_proba(_X[_feats])[:, 1]
+                unlabeled_pairs = unlabeled_pairs[_probs >= _tau].reset_index(drop=True)
+                _after = len(unlabeled_pairs)
+                print(f"✓ Re-scored pool with iter {iteration} model "
+                      f"(tau={_tau:.4f}): {_before:,} → {_after:,} pairs "
+                      f"(dropped {_before - _after:,})")
+
+                # Persist the trimmed pool
+                if unlabeled_pairs_path:
+                    unlabeled_pairs.to_pickle(unlabeled_pairs_path)
+
+                unlabeled_pool = len(unlabeled_pairs)
+                # Update total to reflect the permanently pruned pairs
+                total_pairs = cumulative_labeled + unlabeled_pool
+            else:
+                print(f"⚠ cosine_sim column not in unlabeled_pairs — skipping re-score")
+
+            del _pipeline, _X, _probs
+            gc.collect()
 
         unlabeled_remaining = unlabeled_pool
 
