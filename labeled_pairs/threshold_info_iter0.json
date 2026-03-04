@@ -1,0 +1,6 @@
+{
+  "tau": 0.45261461998977276,
+  "best_tau_accuracy": 0.6947998896714856,
+  "best_tau_f1": 0.5293937346193823,
+  "best_model": "logistic"
+}

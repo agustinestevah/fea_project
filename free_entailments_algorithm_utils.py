@@ -2374,17 +2374,14 @@ def add_graph_features_vectorized(
     positive_label: str = "YES",
     decay: float = 0.9,
     max_hops: int = 5,
+    chunk_size: int = 2_000_000,
 ) -> pd.DataFrame:
     """
-    Vectorized version of :func:`add_graph_features` suitable for millions of rows.
+    Memory-efficient graph features for millions of rows.
 
-    Instead of running BFS per row (O(|df| * (V+E))), this:
-
-    1. Builds the directed entailment graph.
-    2. Runs *one* BFS from every unique node that has outgoing edges
-       (limited to *max_hops*).  With a sparse graph this is extremely fast.
-    3. Stores all reachable (source, target) → distance in a flat dict.
-    4. Vectorised lookup via ``pd.Series.map()`` for all rows.
+    Uses tuple-keyed ``(src, tgt) -> distance`` dict and chunked numpy
+    lookups instead of concatenating 50M strings (which would need ~4 GB
+    of transient Arrow arrays).
 
     Parameters
     ----------
@@ -2402,6 +2399,8 @@ def add_graph_features_vectorized(
         Decay factor applied per hop (score = decay^(hops-1)).
     max_hops : int
         Maximum BFS depth.
+    chunk_size : int
+        Rows per processing chunk (controls peak memory).
 
     Returns
     -------
@@ -2409,6 +2408,7 @@ def add_graph_features_vectorized(
         *df* with ``graph_entailment_score`` and ``graph_equivalence_score``
         columns added in-place.
     """
+    import gc
     from collections import deque
 
     # 1. Build directed graph
@@ -2422,8 +2422,13 @@ def add_graph_features_vectorized(
     print(f"  Graph: {len(graph)} source nodes, "
           f"{sum(len(v) for v in graph.values())} edges")
 
-    # 2. BFS from every source node (only nodes with outgoing edges matter)
-    #    Returns {target_node: hop_distance} for reachable targets within max_hops.
+    if len(graph) == 0:
+        df['graph_entailment_score'] = np.float32(0.0)
+        df['graph_equivalence_score'] = np.float32(0.0)
+        print("  ✓ No edges → all scores zero")
+        return df
+
+    # 2. BFS from every source node
     def _bfs(start: str) -> Dict[str, int]:
         dists: Dict[str, int] = {}
         queue = deque([(start, 0)])
@@ -2440,39 +2445,52 @@ def add_graph_features_vectorized(
                     queue.append((neighbour, depth + 1))
         return dists
 
-    # Collect all unique nodes that appear in df AND have outgoing edges in graph
-    ids1 = df[id1_col].astype(str)
-    ids2 = df[id2_col].astype(str)
-    nodes_to_bfs = (set(ids1) | set(ids2)) & set(graph.keys())
+    # Collect unique IDs that appear in df AND have outgoing edges
+    # Use numpy arrays (not pandas Series) to avoid Arrow overhead
+    _id1_arr = df[id1_col].to_numpy(dtype=str, na_value='')
+    _id2_arr = df[id2_col].to_numpy(dtype=str, na_value='')
+    all_ids = set(_id1_arr) | set(_id2_arr)
+    nodes_to_bfs = all_ids & set(graph.keys())
 
     print(f"  BFS from {len(nodes_to_bfs)} nodes (max_hops={max_hops})...")
 
-    # Flat lookup:  "source|target" → hop distance
-    pair_dist: Dict[str, int] = {}
+    # Tuple lookup: (src, tgt) → hop distance
+    pair_dist: Dict[tuple, int] = {}
     for src in nodes_to_bfs:
         for tgt, d in _bfs(src).items():
-            pair_dist[f"{src}|{tgt}"] = d
+            pair_dist[(src, tgt)] = d
 
     print(f"  Reachable pairs: {len(pair_dist):,}")
 
-    # 3. Vectorised lookup
-    keys_ab = ids1 + '|' + ids2
-    keys_ba = ids2 + '|' + ids1
+    # 3. Chunked lookup — avoids creating 50M-element temporary arrays
+    n = len(df)
+    fwd_arr = np.zeros(n, dtype=np.float32)
+    bidir_arr = np.zeros(n, dtype=np.float32)
 
-    dist_ab = keys_ab.map(pair_dist)
-    dist_ba = keys_ba.map(pair_dist)
+    for lo in range(0, n, chunk_size):
+        hi = min(lo + chunk_size, n)
+        chunk_id1 = _id1_arr[lo:hi]
+        chunk_id2 = _id2_arr[lo:hi]
 
-    # 4. Compute scores
-    fwd = np.where(dist_ab.notna(), decay ** (dist_ab.fillna(0) - 1), 0.0)
-    bwd = np.where(dist_ba.notna(), decay ** (dist_ba.fillna(0) - 1), 0.0)
-    bidir = np.where(
-        dist_ab.notna() & dist_ba.notna(),
-        np.sqrt(fwd * bwd),
-        0.0,
-    )
+        for k in range(hi - lo):
+            a = chunk_id1[k]
+            b = chunk_id2[k]
+            d_ab = pair_dist.get((a, b))
+            if d_ab is not None:
+                s_fwd = decay ** (d_ab - 1)
+                fwd_arr[lo + k] = s_fwd
+                d_ba = pair_dist.get((b, a))
+                if d_ba is not None:
+                    s_bwd = decay ** (d_ba - 1)
+                    bidir_arr[lo + k] = np.sqrt(s_fwd * s_bwd)
 
-    df['graph_entailment_score'] = fwd.astype(np.float32)
-    df['graph_equivalence_score'] = bidir.astype(np.float32)
+    # Free numpy ID arrays
+    del _id1_arr, _id2_arr
+    gc.collect()
+
+    df['graph_entailment_score'] = fwd_arr
+    df['graph_equivalence_score'] = bidir_arr
+    del fwd_arr, bidir_arr
 
     n_nonzero_ent = (df['graph_entailment_score'] > 0).sum()
     n_nonzero_eq  = (df['graph_equivalence_score'] > 0).sum()
@@ -3315,7 +3333,10 @@ def generate_final_df(
     
     # FILTER FIRST — on 75M rows, only ~1k pass the threshold, so we
     # restrict all subsequent work to the tiny filtered subset.
-    df_filtered = df.loc[mask].copy()
+    # Select only the columns we need BEFORE .copy() to avoid copying
+    # heavy columns (text, intermediate features) from the full df.
+    _needed_cols = [c for c in ['id1', 'id2', prob_col] if c in df.columns]
+    df_filtered = df.loc[mask, _needed_cols].copy()
 
     # Handle renaming only if prob_col is different but 'entailment_probability' is requested
     if prob_col != 'entailment_probability' and 'entailment_probability' in keep_cols:
@@ -3324,10 +3345,16 @@ def generate_final_df(
     # Lazy text lookup: add text1/text2 from df_clause if missing
     if df_clause is not None:
         _id_to_text = dict(zip(df_clause[id_col].astype(str), df_clause[text_col]))
+        # Convert Arrow-backed string columns to plain Python objects
+        # to avoid ArrowMemoryError on .map() operations.
         if 'text1' not in df_filtered.columns and 'text1' in keep_cols:
-            df_filtered['text1'] = df_filtered['id1'].astype(str).map(_id_to_text)
+            _ids = df_filtered['id1'].to_numpy(dtype=str, na_value='')
+            df_filtered['text1'] = [_id_to_text.get(x, '') for x in _ids]
+            del _ids
         if 'text2' not in df_filtered.columns and 'text2' in keep_cols:
-            df_filtered['text2'] = df_filtered['id2'].astype(str).map(_id_to_text)
+            _ids = df_filtered['id2'].to_numpy(dtype=str, na_value='')
+            df_filtered['text2'] = [_id_to_text.get(x, '') for x in _ids]
+            del _ids
 
     # Ensure columns exist before selecting
     missing = [c for c in keep_cols if c not in df_filtered.columns]
