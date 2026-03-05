@@ -1,0 +1,10 @@
+{
+  "tau": 0.4837371447576473,
+  "features": [
+    "cos_sim_neighbor_score"
+  ],
+  "best_model": "logistic",
+  "best_tau_accuracy": 0.7065093819147924,
+  "best_tau_f1": 0.5559774069552867,
+  "best_tau_recall": 0.0010084076361132025
+}

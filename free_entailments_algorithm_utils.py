@@ -4277,9 +4277,13 @@ def load_pipeline_data(
     elif not test and unlabeled_pairs_path:
         unlabeled_pairs = pd.read_pickle(unlabeled_pairs_path)
         print(f"✓ Loaded unlabeled_pairs: {len(unlabeled_pairs)} rows")
+    elif not test:
+        # Production new mode: no pre-built pool — candidates generated after tau each iteration.
+        print("Production mode: no pre-built unlabeled_pairs pool.")
+        print("  Candidates will be generated after tau is learned each iteration.")
     else:
-        print(f"⚠ WARNING: No data loaded!")
-        print(f"  test={test}, remaining_llm_calls_path={remaining_llm_calls_path}, unlabeled_pairs_path={unlabeled_pairs_path}")
+        print(f"⚠ WARNING: Test mode but no remaining_llm_calls_path provided!")
+        print(f"  test={test}, remaining_llm_calls_path={remaining_llm_calls_path}")
 
     print(f"✓ All data loaded from pickle files")
 
@@ -4302,6 +4306,7 @@ def run_fea_papermill(
     embedding_cache: dict = None,
     temp_dir: str = "fea_iterations/temp_data",
     data_on_disk: bool = False,
+    production_mode: bool = False,
 ) -> Tuple[pd.DataFrame, str]:
     """
     Run FreeEntailmentAlgorithm.ipynb via papermill and retrieve results.
@@ -4324,6 +4329,10 @@ def run_fea_papermill(
         If True, skip pickling — the caller already saved everything to
         *temp_dir* and freed the large DataFrames to reclaim RAM before
         FreeEntailmentAlgorithm spawns a new process.
+    production_mode : bool, default False
+        If True, FreeEntailmentAlgorithm skips all df_candidates/df_crossed
+        work and only trains the model + saves artifacts.  Candidates are
+        generated post-tau in FEA_Pipeline instead.
 
     Returns
     -------
@@ -4336,19 +4345,19 @@ def run_fea_papermill(
     os.makedirs(temp_dir, exist_ok=True)
 
     if not data_on_disk:
-        # Short-circuit: if df_candidates or df_obs_ent are empty, there's nothing
-        # for FreeEntailmentAlgorithm to train on — return empty results immediately.
-        if len(df_candidates) == 0 or len(df_obs_ent) == 0:
-            print(f"⚠ Skipping FreeEntailmentAlgorithm (empty data: "
-                  f"{len(df_candidates)} candidates, {len(df_obs_ent)} entailed pairs)")
+        # Short-circuit: if df_obs_ent is empty, there's nothing to train on.
+        if len(df_obs_ent) == 0:
+            print(f"⚠ Skipping FreeEntailmentAlgorithm (0 entailed pairs)")
             df_final = pd.DataFrame(columns=['id1', 'id2', 'text1', 'text2', 'entailment_probability'])
             fig_html = "<p>No data for this iteration</p>"
             return df_final, fig_html
 
-        df_candidates.to_pickle(f"{temp_dir}/df_candidates.pkl")
-        print(f"  df_candidates pickled: {len(df_candidates):,} rows, "
-              f"cols={list(df_candidates.columns)}")
-        df_crossed.to_pickle(f"{temp_dir}/df_crossed.pkl")
+        if df_candidates is not None:
+            df_candidates.to_pickle(f"{temp_dir}/df_candidates.pkl")
+            print(f"  df_candidates pickled: {len(df_candidates):,} rows, "
+                  f"cols={list(df_candidates.columns)}")
+        if df_crossed is not None:
+            df_crossed.to_pickle(f"{temp_dir}/df_crossed.pkl")
         df_labeled.to_pickle(f"{temp_dir}/df_labeled.pkl")
         df_labeled_crossed.to_pickle(f"{temp_dir}/df_labeled_crossed.pkl")
         df_obs_ent.to_pickle(f"{temp_dir}/df_obs_ent.pkl")
@@ -4361,14 +4370,18 @@ def run_fea_papermill(
     # Only pass embedding_cache_path if the file exists (cosine sims may
     # already be pre-computed in the DataFrames by Pipeline).
     _emb_cache_pkl = f"{temp_dir}/embedding_cache.pkl"
+    _cand_pkl = f"{temp_dir}/df_candidates.pkl"
+    _crossed_pkl = f"{temp_dir}/df_crossed.pkl"
     parameters = {
-        "df_candidates_path": f"{temp_dir}/df_candidates.pkl",
-        "df_crossed_path": f"{temp_dir}/df_crossed.pkl",
+        "df_candidates_path": _cand_pkl if os.path.exists(_cand_pkl) else "",
+        "df_crossed_path": _crossed_pkl if os.path.exists(_crossed_pkl) else "",
         "df_labeled_path": f"{temp_dir}/df_labeled.pkl",
         "df_labeled_crossed_path": f"{temp_dir}/df_labeled_crossed.pkl",
         "df_obs_ent_path": f"{temp_dir}/df_obs_ent.pkl",
         "df_clause_path": f"{temp_dir}/df_clause.pkl",
         "embedding_cache_path": _emb_cache_pkl if os.path.exists(_emb_cache_pkl) else "",
+        "production_mode": production_mode,
+        "iteration_number": iteration_number,
     }
 
     output_notebook_path = f"fea_iterations/FEA_iter_{iteration_number}.ipynb"
@@ -4601,38 +4614,41 @@ def finalize_pipeline_iteration(
         # Track in llm_labeled_pairs
         append_to_llm_labeled_pairs(df_to_llm)
 
-        # Set-based anti-join — avoids creating a full 75M-row merge copy.
-        # df_to_llm is tiny (≤ 1 k rows), so the set lookup is instant.
-        remove_set = set(
-            zip(
-                df_to_llm['sentence_id_1'].astype(str),
-                df_to_llm['sentence_id_2'].astype(str),
+        if unlabeled_pairs is not None:
+            # Set-based anti-join — avoids creating a full 75M-row merge copy.
+            # df_to_llm is tiny (≤ 1 k rows), so the set lookup is instant.
+            remove_set = set(
+                zip(
+                    df_to_llm['sentence_id_1'].astype(str),
+                    df_to_llm['sentence_id_2'].astype(str),
+                )
             )
-        )
-        # Map column names: df_to_llm uses sentence_id_1/2, unlabeled uses id1/id2
-        before_n = len(unlabeled_pairs)
-        n = len(unlabeled_pairs)
-        mask = np.ones(n, dtype=bool)
-        chunk_sz = 2_000_000
-        for lo in range(0, n, chunk_sz):
-            hi = min(lo + chunk_sz, n)
-            ids1 = unlabeled_pairs['id1'].iloc[lo:hi].astype(str).tolist()
-            ids2 = unlabeled_pairs['id2'].iloc[lo:hi].astype(str).tolist()
-            for j in range(hi - lo):
-                if (ids1[j], ids2[j]) in remove_set:
-                    mask[lo + j] = False
-            del ids1, ids2
+            # Map column names: df_to_llm uses sentence_id_1/2, unlabeled uses id1/id2
+            before_n = len(unlabeled_pairs)
+            n = len(unlabeled_pairs)
+            mask = np.ones(n, dtype=bool)
+            chunk_sz = 2_000_000
+            for lo in range(0, n, chunk_sz):
+                hi = min(lo + chunk_sz, n)
+                ids1 = unlabeled_pairs['id1'].iloc[lo:hi].astype(str).tolist()
+                ids2 = unlabeled_pairs['id2'].iloc[lo:hi].astype(str).tolist()
+                for j in range(hi - lo):
+                    if (ids1[j], ids2[j]) in remove_set:
+                        mask[lo + j] = False
+                del ids1, ids2
 
-        unlabeled_pairs = unlabeled_pairs[mask]
-        unlabeled_pairs.reset_index(drop=True, inplace=True)
-        removed = before_n - len(unlabeled_pairs)
+            unlabeled_pairs = unlabeled_pairs[mask]
+            unlabeled_pairs.reset_index(drop=True, inplace=True)
+            removed = before_n - len(unlabeled_pairs)
 
-        print(f"✓ Removed {removed} pairs from unlabeled_pairs")
-        print(f"✓ Remaining pairs for future iterations: {len(unlabeled_pairs)}")
+            print(f"✓ Removed {removed} pairs from unlabeled_pairs")
+            print(f"✓ Remaining pairs for future iterations: {len(unlabeled_pairs)}")
 
-        if unlabeled_pairs_path:
-            unlabeled_pairs.to_pickle(unlabeled_pairs_path)
-            print(f"✓ Saved updated unlabeled_pairs to {unlabeled_pairs_path}")
+            if unlabeled_pairs_path:
+                unlabeled_pairs.to_pickle(unlabeled_pairs_path)
+                print(f"✓ Saved updated unlabeled_pairs to {unlabeled_pairs_path}")
+        else:
+            print("✓ No persistent unlabeled_pairs pool — candidates generated fresh each iteration.")
 
         sb.glue('df_to_llm', df_to_llm)
         print(f"✓ Glued df_to_llm to scrapbook for FEA_Loop retrieval")
@@ -4878,7 +4894,7 @@ def run_fea_loop(
             next_input_file = f"{labeled_pairs_dir}/Results_DS_BtoS_iteration_{iteration + 1}.csv"
 
             # --- Step 1: Send forward-direction pairs to LLM ---
-            one_way_output = f"{labeled_pairs_dir}/Results_DS_BtoS_iteration_{iteration + 1}_one_way"
+            one_way_output = f"{labeled_pairs_dir}/Results_DS_BtoS_iteration_{iteration + 1}_one_way.csv"
 
             evaluator_notebook = os.path.join(output_dir, f"Evaluator_iter_{iteration}.ipynb")
             evaluator_params = {
@@ -4906,11 +4922,10 @@ def run_fea_loop(
             print(f"✓ Forward LLM evaluation complete")
 
             # --- Step 2: Process one-way results bidirectionally ---
-            one_way_csv = f"{one_way_output}.csv"
-            if os.path.exists(one_way_csv):
-                df_one_way = pd.read_csv(one_way_csv)
+            if os.path.exists(one_way_output):
+                df_one_way = pd.read_csv(one_way_output)
             else:
-                print(f"⚠ ERROR: One-way output not found: {one_way_csv}")
+                print(f"⚠ ERROR: One-way output not found: {one_way_output}")
                 break
 
             df_bidirectional = process_llm_results_bidirectional(
